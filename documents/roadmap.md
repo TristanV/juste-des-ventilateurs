@@ -1,7 +1,7 @@
 # Roadmap — Juste des Ventilateurs
 
 Projet M2 Data/IA — LaPlateforme_  
-Version 1.0 — Juin 2026
+Version 1.1 — Juin 2026
 
 ---
 
@@ -20,49 +20,61 @@ Phase 6 : Boucle fermée & éval   [Semaine 5-6]
 
 ---
 
-## Phase 1 — Prise en main et compréhension
+## Phase 1 — Prise en main et compréhension ✅
 
 **Objectif :** Comprendre l'environnement jumeaux-chauds et valider la connectivité.
 
 ### Tâches
 
-- [ ] Cloner et lancer jumeaux-chauds avec le scénario `stress`
-- [ ] Explorer les topics MQTT (`cluster/+/machine/+`) et la structure des payloads
-- [ ] Identifier et tester les endpoints REST de pilotage des ventilateurs
-  - `PUT /machines/{id}/fan_speed` — vitesse manuelle
-  - `PUT /machines/{id}/fan_mode` — mode auto/manual
-  - `GET /machines/{id}` — snapshot complet
-  - `GET /cluster/status` — état du cluster
-- [ ] Comprendre les transitions d'état : `on` → `degraded` → `off` (overheat) → `on` (recovery)
-- [ ] Documenter la logique de protection thermique (seuils `t_shutdown_c`, `t_restart_c`)
-- [ ] Rédiger le compte-rendu de prise en main dans `notebooks/01_exploration.ipynb`
+- [x] Structure du projet créée (répertoires, packages Python, Docker)
+- [x] Documentation initiale (README, roadmap, specifications)
+- [x] Supervisor placeholder opérationnel (Docker tourne sans erreur)
+- [x] Analyse complète des topics MQTT de jumeaux-chauds
+  - Root : `dt/`, cluster : `cluster_alpha`
+  - Topics : `.../telemetry` (QoS 0, 1/s), `.../status` (QoS 1), `.../fault` (QoS 1), `.../summary` (QoS 1)
+- [x] Analyse des endpoints REST de pilotage des ventilateurs
+- [x] Identification des seuils thermiques par rôle (base.yaml)
+- [ ] `notebooks/01_exploration.ipynb` : exploration MQTT et API interactive
 
-### Livrables
-- `notebooks/01_exploration.ipynb` : exploration MQTT et API
-- Schéma annoté des topics et payloads MQTT
+### Livrables ✅
+- Structure du projet, Docker, supervisor placeholder
+- `documents/roadmap.md`, `documents/specifications.md`, `README.md`
+- `.env.example`, `build-clean-app.bat`
 
 ---
 
-## Phase 2 — Ingestion et stockage des données
+## Phase 2 — Ingestion et stockage des données ✅
 
 **Objectif :** Collecter en continu la télémétrie et constituer des datasets reproductibles.
 
 ### Tâches
 
-- [ ] Développer `ingest/mqtt_subscriber.py` : subscriber MQTT async fiable
-- [ ] Implémenter `ingest/normalizer.py` : parsing et normalisation des payloads
-  - Schéma unifié : `(timestamp, cluster_id, machine_id, status, temperature_c, load, power_w, fan_rpms[], energy_kwh, sensors{}, faults[])`
-- [ ] Choisir et implémenter le backend de stockage :
-  - Option A (recommandée) : TimescaleDB (si jumeaux-chauds est lancé avec profil `storage`)
-  - Option B : Parquet/CSV versionné par épisode et seed pour reproductibilité ML
-- [ ] Développer `ingest/dataset_exporter.py` : export train/val/test par épisode ou seed
-- [ ] Documenter le schéma de données dans `documents/specifications.md`
-- [ ] Tests unitaires : `tests/test_ingest.py`
+- [x] `ingest/mqtt_subscriber.py` : subscriber MQTT async avec reconnexion automatique (backoff exponentiel)
+  - Souscription : `dt/cluster_alpha/+/telemetry`, `.../status`, `.../fault`, `.../summary`
+  - Mode CLI : `--duration N` (épisode borné) ou `--continuous` (daemon)
+- [x] `ingest/normalizer.py` : parsing et normalisation des payloads
+  - Schéma unifié : timestamp, cluster_id, machine_id, role, status, temperature_c, power_w, fan_rpm_mean/std, load_estimated, has_fault, fault_types...
+  - Gestion des 4 types de messages : telemetry, status_event, fault_event, cluster_summary
+- [x] `ingest/dataset_exporter.py` : export Parquet partitionné par machine et épisode
+  - Fallback CSV si pandas/pyarrow non disponibles
+  - `metadata.json` par épisode (scenario, seed, durée, n_records)
+- [x] `tests/test_ingest.py` : 15 tests unitaires (Normalizer + DatasetExporter)
+- [x] `data/schema.md` : schéma unifié documenté
+- [ ] `notebooks/01_exploration.ipynb` : collecte interactive et visualisation
 
-### Livrables
-- `ingest/` : module complet d'ingestion
-- `data/raw/` : premiers jeux de données collectés
-- `data/schema.md` : description du schéma
+### Livrables ✅
+- `ingest/mqtt_subscriber.py`, `ingest/normalizer.py`, `ingest/dataset_exporter.py`
+- `tests/test_ingest.py`
+- `data/schema.md`
+
+### Commandes de collecte
+```bash
+# Collecte pendant 10 minutes
+python -m ingest.mqtt_subscriber --duration 600 --episode 001
+
+# Collecte continue
+python -m ingest.mqtt_subscriber --continuous --episode 001
+```
 
 ---
 

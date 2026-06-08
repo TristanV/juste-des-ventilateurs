@@ -39,10 +39,10 @@ jumeaux-chauds (simulateur)          juste-des-ventilateurs (ce projet)
 
 ```
 juste-des-ventilateurs/
-├── ingest/                     # Collecte MQTT et normalisation
-│   ├── mqtt_subscriber.py      # Subscriber MQTT async
-│   ├── normalizer.py           # Parsing et schéma unifié
-│   └── dataset_exporter.py     # Export Parquet/CSV par épisode
+├── ingest/                     # Collecte MQTT et normalisation ✅
+│   ├── mqtt_subscriber.py      # Subscriber MQTT async (reconnexion auto, backoff)
+│   ├── normalizer.py           # Parsing payload → schéma unifié (4 types de messages)
+│   └── dataset_exporter.py     # Export Parquet partitionné par machine/épisode
 │
 ├── features/                   # Ingénierie des features temporelles
 │   ├── temporal.py             # Dérivées de température, rolling means
@@ -142,8 +142,17 @@ docker compose up -d
 ### Collecter des données
 
 ```bash
-# Collecte MQTT pendant 10 minutes, export en Parquet
-python -m ingest.mqtt_subscriber --duration 600 --output data/raw/episode_01
+# Collecte MQTT pendant 10 minutes, export Parquet → data/raw/episode=001/
+python -m ingest.mqtt_subscriber --duration 600 --episode 001
+
+# Collecte continue (mode daemon)
+python -m ingest.mqtt_subscriber --continuous --episode 001
+```
+
+### Lancer les tests
+
+```bash
+pytest tests/ -v
 ```
 
 ### Entraîner les modèles
