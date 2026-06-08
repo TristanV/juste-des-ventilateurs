@@ -13,7 +13,7 @@ services:
       - ./models:/app/models
       - ./supervisor/logs:/app/supervisor/logs
     network_mode: host   # rejoindre le réseau de jumeaux-chauds (MQTT :1883, API :8000)
-    restart: on-failure
+    restart: "no"
     command: python -m supervisor.supervisor
 
   # Service optionnel : collecte continue en arrière-plan
