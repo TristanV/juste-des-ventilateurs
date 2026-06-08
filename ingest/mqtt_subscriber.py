@@ -28,6 +28,7 @@ from datetime import datetime, timezone
 from typing import Callable
 
 import aiomqtt
+import httpx
 from dotenv import load_dotenv
 
 from ingest.normalizer import Normalizer
@@ -160,6 +161,73 @@ class MqttSubscriber:
 
 
 # ---------------------------------------------------------------------------
+# Récupération des métadonnées depuis l'API jumeaux-chauds
+# ---------------------------------------------------------------------------
+
+async def _fetch_cluster_metadata(api_base_url: str) -> dict:
+    """Interroge GET /cluster/status pour récupérer les specs machines et le scénario.
+
+    Retourne un dict avec :
+      - machines : {machine_id: {t_shutdown_c, t_restart_c, fan_max_rpm, role}}
+      - scenario : scénario actif (si exposé)
+      - cluster_id : identifiant du cluster
+    """
+    result: dict = {"machines": {}, "scenario": "unknown", "cluster_id": "unknown"}
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            resp = await client.get(f"{api_base_url}/cluster/status")
+            resp.raise_for_status()
+            data = resp.json()
+
+        result["cluster_id"] = data.get("cluster_id", "unknown")
+        result["scenario"] = data.get("scenario", os.getenv("SCENARIO", "unknown"))
+
+        # Extraire les specs thermiques de chaque machine
+        for machine_id, machine in data.get("machines", {}).items():
+            result["machines"][machine_id] = {
+                "role": machine.get("role", "unknown"),
+                "t_shutdown_c": _extract_thermal(machine, "t_shutdown_c", 88.0),
+                "t_restart_c": _extract_thermal(machine, "t_restart_c", 50.0),
+                "fan_max_rpm": _extract_fan(machine, "fan_max_rpm", 5000),
+                "fan_count": len(machine.get("fans", [])),
+            }
+        logger.info(
+            "Métadonnées cluster récupérées : %d machines, scénario=%s",
+            len(result["machines"]), result["scenario"],
+        )
+    except Exception as exc:
+        logger.warning(
+            "Impossible de récupérer les métadonnées cluster depuis %s : %s — "
+            "les specs machines seront approximées.",
+            api_base_url, exc,
+        )
+    return result
+
+
+def _extract_thermal(machine: dict, key: str, default: float) -> float:
+    """Cherche une valeur thermique dans le snapshot machine (peut être imbriquée)."""
+    # Le snapshot API expose temperature_c et status, mais pas t_shutdown directement.
+    # On utilise les valeurs de référence de base.yaml par rôle comme fallback.
+    role = machine.get("role", "worker")
+    role_defaults = {
+        "master": {"t_shutdown_c": 90.0, "t_restart_c": 55.0},
+        "worker": {"t_shutdown_c": 88.0, "t_restart_c": 50.0},
+    }
+    return role_defaults.get(role, {}).get(key, default)
+
+
+def _extract_fan(machine: dict, key: str, default: int) -> int:
+    """Extrait les specs ventilateur depuis le snapshot machine."""
+    fans = machine.get("fans", [])
+    if key == "fan_max_rpm":
+        # fan_max_rpm n'est pas exposé dans le snapshot — valeur fixe de base.yaml
+        return 5000
+    if key == "fan_count":
+        return len(fans)
+    return default
+
+
+# ---------------------------------------------------------------------------
 # Point d'entrée CLI
 # ---------------------------------------------------------------------------
 
@@ -171,8 +239,15 @@ async def _run_collection(
     episode_id: str,
     output_dir: str,
     duration_s: float | None,
+    api_base_url: str,
 ) -> None:
     """Lance la collecte et exporte en Parquet à la fin."""
+    # Timestamp réel de début
+    ts_start_real = datetime.now(timezone.utc)
+
+    # Récupérer les métadonnées cluster avant de commencer
+    cluster_meta = await _fetch_cluster_metadata(api_base_url)
+
     exporter = DatasetExporter(output_dir=output_dir, episode_id=episode_id)
     records: list[dict] = []
 
@@ -214,15 +289,46 @@ async def _run_collection(
         logger.info("Collecte continue (Ctrl+C pour arrêter)...")
         await subscriber.run()
 
+    # Timestamp réel de fin
+    ts_end_real = datetime.now(timezone.utc)
+    real_duration_s = (ts_end_real - ts_start_real).total_seconds()
+
     # Export
     if records:
         logger.info("Export de %d enregistrements...", len(records))
         path = exporter.export_parquet(records)
         logger.info("Données exportées : %s", path)
+
+        # Extraire les timestamps simulés depuis les enregistrements collectés
+        ts_values = [
+            r["timestamp"] for r in records
+            if r.get("timestamp") is not None and r.get("msg_type") == "telemetry"
+        ]
+        ts_sim_start = min(ts_values).isoformat() if ts_values else None
+        ts_sim_end = max(ts_values).isoformat() if ts_values else None
+        sim_duration_s = (
+            (max(ts_values) - min(ts_values)).total_seconds() if len(ts_values) > 1 else None
+        )
+
         exporter.write_metadata(
-            scenario=os.getenv("SCENARIO", "unknown"),
-            duration_s=duration_s,
+            scenario=cluster_meta.get("scenario", os.getenv("SCENARIO", "unknown")),
+            duration_s=real_duration_s,
             n_records=len(records),
+            extra={
+                "ts_start_real": ts_start_real.isoformat(),
+                "ts_end_real": ts_end_real.isoformat(),
+                "ts_sim_start": ts_sim_start,
+                "ts_sim_end": ts_sim_end,
+                "sim_duration_s": sim_duration_s,
+                "machines": cluster_meta.get("machines", {}),
+                "cluster_id": cluster_meta.get("cluster_id", cluster_id),
+                "broker_host": broker_host,
+                "broker_port": broker_port,
+            },
+        )
+        logger.info(
+            "Collecte terminée : %.0fs réelles, %.0fs simulées, %d enregistrements.",
+            real_duration_s, sim_duration_s or 0, len(records),
         )
     else:
         logger.warning("Aucun enregistrement collecté.")
@@ -250,7 +356,13 @@ def main() -> None:
     broker_port = int(os.getenv("MQTT_BROKER_PORT", "1883"))
     cluster_id = os.getenv("CLUSTER_ID", "cluster_alpha")
     topic_root = os.getenv("MQTT_TOPIC_ROOT", "dt")
+    api_base_url = os.getenv("API_BASE_URL", "http://localhost:8000")
     duration = None if args.continuous else args.duration
+
+    # Sur Windows, la boucle asyncio par défaut (ProactorEventLoop) ne supporte
+    # pas add_reader/add_writer utilisés par aiomqtt. On force SelectorEventLoop.
+    if os.name == "nt":
+        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
     asyncio.run(_run_collection(
         broker_host=broker_host,
@@ -260,6 +372,7 @@ def main() -> None:
         episode_id=args.episode,
         output_dir=args.output,
         duration_s=duration,
+        api_base_url=api_base_url,
     ))
 
 
