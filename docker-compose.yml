@@ -1,0 +1,31 @@
+# docker-compose.yml — Juste des Ventilateurs
+# Lance le superviseur ML en parallèle de jumeaux-chauds.
+# jumeaux-chauds doit être lancé séparément (même hôte ou réseau partagé).
+
+services:
+  supervisor:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    env_file: .env
+    volumes:
+      - ./data:/app/data
+      - ./models:/app/models
+      - ./supervisor/logs:/app/supervisor/logs
+    network_mode: host   # rejoindre le réseau de jumeaux-chauds (MQTT :1883, API :8000)
+    restart: on-failure
+    command: python -m supervisor.supervisor
+
+  # Service optionnel : collecte continue en arrière-plan
+  ingest:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    env_file: .env
+    volumes:
+      - ./data:/app/data
+    network_mode: host
+    profiles: [ingest]
+    command: python -m ingest.mqtt_subscriber --continuous
+
+volumes: {}

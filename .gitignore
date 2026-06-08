@@ -216,3 +216,30 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Jupyter
+.jupyter/
+
+# Données collectées (volumineuses, reproductibles via seed)
+data/raw/
+data/processed/
+data/*.parquet
+data/*.csv
+
+# Modèles entraînés (sérialisés)
+models/failure_prediction/saved/
+models/fan_control/saved/
+*.pkl
+*.joblib
+*.onnx
+
+# Logs et résultats d'évaluation
+evaluation/results/
+supervisor/logs/
+*.log
+
+# Configuration locale (secrets)
+.env
+
+# Docker volumes locaux
+timescale_data/
