@@ -240,6 +240,7 @@ async def _run_collection(
     output_dir: str,
     duration_s: float | None,
     api_base_url: str,
+    scenario_override: str | None = None,
 ) -> None:
     """Lance la collecte et exporte en Parquet à la fin."""
     # Timestamp réel de début
@@ -310,8 +311,14 @@ async def _run_collection(
             (max(ts_values) - min(ts_values)).total_seconds() if len(ts_values) > 1 else None
         )
 
+        # Priorité scénario : --scenario CLI > .env SCENARIO > API > "unknown"
+        scenario = (
+            scenario_override
+            or cluster_meta.get("scenario")
+            or "unknown"
+        )
         exporter.write_metadata(
-            scenario=cluster_meta.get("scenario", os.getenv("SCENARIO", "unknown")),
+            scenario=scenario,
             duration_s=real_duration_s,
             n_records=len(records),
             extra={
@@ -350,6 +357,8 @@ def main() -> None:
     parser.add_argument("--output", type=str,
                         default=os.getenv("PARQUET_DATA_DIR", "./data"),
                         help="Répertoire de sortie")
+    parser.add_argument("--scenario", type=str, default=None,
+                        help="Nom du scénario jumeaux-chauds actif (ex: stress, heatwave)")
     args = parser.parse_args()
 
     broker_host = os.getenv("MQTT_BROKER_HOST", "localhost")
@@ -358,6 +367,8 @@ def main() -> None:
     topic_root = os.getenv("MQTT_TOPIC_ROOT", "dt")
     api_base_url = os.getenv("API_BASE_URL", "http://localhost:8000")
     duration = None if args.continuous else args.duration
+    # Scénario : priorité à --scenario, puis SCENARIO dans .env, puis "unknown"
+    scenario_override = args.scenario or os.getenv("SCENARIO", None)
 
     # Sur Windows, la boucle asyncio par défaut (ProactorEventLoop) ne supporte
     # pas add_reader/add_writer utilisés par aiomqtt. On force SelectorEventLoop.
@@ -373,6 +384,7 @@ def main() -> None:
         output_dir=args.output,
         duration_s=duration,
         api_base_url=api_base_url,
+        scenario_override=scenario_override,
     ))
 
 
