@@ -176,14 +176,14 @@ class ScoreController:
         beta_grid  = beta_grid  or [0.2, 0.3, 0.4]
         gamma_grid = gamma_grid or [0.05, 0.15]
 
+        if risk_scores_train is None:
+            risk_scores_train = np.zeros(len(X_train))
+
         # Echantillon pour accélérer la grid search
         if len(X_train) > 5000:
             idx = np.random.default_rng(42).choice(len(X_train), 5000, replace=False)
-            X_train          = X_train.iloc[idx].reset_index(drop=True)
+            X_train           = X_train.iloc[idx].reset_index(drop=True)
             risk_scores_train = risk_scores_train[idx]
-
-        if risk_scores_train is None:
-            risk_scores_train = np.zeros(len(X_train))
 
         # Détecter t_shutdown
         if "margin_to_shutdown" in X_train.columns:
