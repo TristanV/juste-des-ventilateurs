@@ -409,9 +409,8 @@ def main():
                for p in sorted(RAW_DIR.glob("episode=*")) if p.is_dir()
                and p.name != "episode="}
     proc_eps = {p.name.replace("episode=", ""): p
-                for p in sorted(PROCESSED_DIR.glob("episode=*")) if p.is_dir()
-                and p.name != "episode="
-                and not p.name.endswith("=data")}
+                for p in sorted(PROCESSED_DIR.glob("episode=*"))
+                if p.is_dir() and p.name != "episode=" and not p.name.endswith("=data")}
 
     all_ep_ids = sorted(set(raw_eps) | set(proc_eps))
     if args.episode:
@@ -422,9 +421,9 @@ def main():
 
     print(f"  Episodes raw      : {', '.join(sorted(raw_eps)) or 'aucun'}")
     print(f"  Episodes processed: {', '.join(sorted(proc_eps)) or 'aucun'}")
-    print(f"  Episodes analysés : {', '.join(all_ep_ids)}")
+    print(f"  Episodes analyses : {', '.join(all_ep_ids)}")
 
-    # Collecte pour le résumé global
+    # Collecte pour le resume global
     global_data = []
 
     for ep_id in all_ep_ids:
@@ -445,9 +444,9 @@ def main():
         global_summary(global_data)
 
     print()
-    sep("═")
-    print("  EDA terminée.")
-    sep("═")
+    sep("=")
+    print("  EDA terminee.")
+    sep("=")
 
 
 if __name__ == "__main__":

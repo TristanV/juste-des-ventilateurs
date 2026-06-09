@@ -209,7 +209,7 @@ python -m evaluation.failure_prediction_eval --label failure_60s --models baseli
 
 ---
 
-## Phase 5 — Contrôleur de régulation des ventilateurs
+## Phase 5 — Contrôleur de régulation des ventilateurs ✅
 
 **Objectif :** Définir une politique d'actionnement des ventilateurs, sûre et sobre en énergie.
 
@@ -220,32 +220,58 @@ Actions discrétisées : `RPM ∈ {0, 1500, 2500, 3500, 4500}` par ventilateur.
 
 ### Tâches
 
-- [ ] **Baseline 1 : Ventilateur fixe** (`models/fan_control/baseline_fixed.py`)
-  - RPM constant (plusieurs valeurs testées : 0, 2500, 4500)
-- [ ] **Baseline 2 : Contrôle à seuils** (`models/fan_control/baseline_threshold.py`)
-  - `if T > T1: RPM = high; elif T > T2: RPM = medium; else: RPM = low`
-- [ ] **Baseline 3 : PID simple** (`models/fan_control/baseline_pid.py`)
-  - Contrôleur proportionnel-intégral-dérivé, cible de température configurable
-- [ ] **Contrôleur ML supervisé** (`models/fan_control/supervised_controller.py`)
-  - Classifier qui apprend la "meilleure action" à partir des données offline
-  - Labels d'action générés par simulation ou expert (baseline optimisée)
-- [ ] **Contrôleur à score multi-objectif** (`models/fan_control/score_controller.py`)
-  - Fonction de coût : `J(t) = α·risk(t) + β·heat(t) + γ·energy(t) + δ·|ΔRPM_t|`
-  - Paramètres α, β, γ, δ optimisés par grid search ou Bayesian optimization
+- [x] **Baseline 1 : Ventilateur fixe** (`models/fan_control/baseline_fixed.py`)
+  - RPM constant (niveaux testés : 1500, 2500, 4500)
+  - Interface : `decide(state, risk_score)`, `decide_batch(X)`, `save()`/`load()`
+- [x] **Baseline 2 : Contrôle à seuils** (`models/fan_control/baseline_threshold.py`)
+  - `if T > T_high: RPM=4500; elif T > T_med: RPM=3500; elif T > T_low: RPM=2500; else: RPM=1500`
+  - Seuils optimisés par grid search (score = Recall_failure - 0.1*mean_rpm_norm)
+- [x] **Baseline 3 : PID simple** (`models/fan_control/baseline_pid.py`)
+  - Cible : `T_target = 0.80 × t_shutdown`
+  - Commande clampée → quantifiée au niveau RPM discret le plus proche
+  - Gains Kp, Ki, Kd optimisés par grid search
+- [x] **Contrôleur ML supervisé** (`models/fan_control/supervised_controller.py`)
+  - RandomForestClassifier multiclasse sur `action_class` (0-3)
+  - Features : toutes les features du splitter + risk_score optionnel
+  - StandardScaler + class_weight=balanced
+- [x] **Contrôleur à score multi-objectif** (`models/fan_control/score_controller.py`)
+  - `J(a) = α·risk + β·heat + γ·energy(a) + δ·|ΔRPM|/RPM_MAX`
+  - Paramètres α, β, γ, δ optimisés par grid search
 - [ ] **(Optionnel avancé) Bandit contextuel** (`models/fan_control/contextual_bandit.py`)
-  - LinUCB ou similaire, exploration/exploitation adaptative
-- [ ] **Évaluation comparative** (`evaluation/fan_control_eval.py`)
-  - Métriques : nb shutdowns, température moyenne, énergie consommée, nb incidents évités
+- [x] **Évaluation comparative** (`evaluation/fan_control_eval.py`)
+  - Métriques : mean_rpm, T_mean, %temps_critique, action_accuracy, rpm_mae, high_rpm_when_dangerous
+  - risk_scores fournis par le prédicteur logistic (Phase 4)
 - [ ] Notebook : `notebooks/04_fan_control.ipynb`
 
 ### Métriques cibles
 - Réduction du nombre de shutdowns vs baseline auto native ≥ 50%
 - Consommation énergétique des fans ≤ baseline "full speed" (économie ≥ 20%)
 
-### Livrables
-- `models/fan_control/` : code + modèles sauvegardés
-- `evaluation/results/fan_control_results.json`
-- `notebooks/04_fan_control.ipynb`
+### Livrables ✅
+- `models/fan_control/baseline_fixed.py`
+- `models/fan_control/baseline_threshold.py`
+- `models/fan_control/baseline_pid.py`
+- `models/fan_control/supervised_controller.py`
+- `models/fan_control/score_controller.py`
+- `evaluation/fan_control_eval.py`
+- `train_fan_controllers.bat`
+- `tests/test_phase5_controllers.py`
+
+### Commandes
+```bash
+# Entrainement + evaluation comparative (tous les controleurs)
+train_fan_controllers.bat
+
+# Evaluation seule
+python -m evaluation.fan_control_eval --label failure_60s
+
+# Controleurs specifiques
+python -m evaluation.fan_control_eval --models baseline_pid score_controller
+
+# Tests
+pytest tests/test_phase5_controllers.py -v
+pytest tests/test_phase5_controllers.py -v -m "not slow"
+```
 
 ---
 
