@@ -323,11 +323,22 @@ Colonnes exclues des features : timestamps, IDs, labels, colonnes 100% NaN (`mac
 
 **Lancement :**
 ```bash
+train_models.bat                   # entrainement + evaluation complete
 python -m evaluation.failure_prediction_eval --label failure_60s
-python -m evaluation.failure_prediction_eval --models gradient_boosting --label failure_30s
 ```
 
-Résultats exportés dans `evaluation/results/failure_prediction_results.json`.
+**Résultats obtenus** (`evaluation/results/failure_prediction_results_failure_60s.json`) :
+
+| Modèle | F1 | Recall | PR-AUC | Lead time médian |
+|--------|----|--------|--------|-----------------|
+| baseline | 0.141 | 0.130 | 0.171 | 8.7s |
+| logistic | 0.851 | 0.930 | 0.812 | 72s |
+| random_forest | 0.877 | 0.930 | 0.759 | 5876s |
+| gradient_boosting | **0.877** | **0.931** | 0.757 | 5876s |
+
+**Recommandation :** régression logistique pour le superviseur (meilleur taux de détection d'incidents 12/14, PR-AUC supérieur).
+
+**Notebook :** `notebooks/03_failure_prediction.ipynb` — courbes PR/ROC, matrices de confusion, feature importance, analyse des résultats.
 
 ---
 

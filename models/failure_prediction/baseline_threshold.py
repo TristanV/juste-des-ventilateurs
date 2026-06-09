@@ -146,7 +146,7 @@ class ThresholdPredictor:
     ) -> np.ndarray:
         temp = self._get_col(X, "temperature_c", default=0.0)
         hot  = self._get_col(X, "time_in_hot_zone_s", default=0.0)
-        return ((temp > t_warn) & (hot > n_sec)).astype(int).values
+        return ((temp > t_warn) & (hot > n_sec)).astype(int)
 
     @staticmethod
     def _get_col(X: pd.DataFrame, col: str, default: float) -> np.ndarray:

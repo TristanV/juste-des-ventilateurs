@@ -10,10 +10,19 @@ Usage :
 from __future__ import annotations
 
 import argparse
+import io
 import json
 import sys
 import warnings
 from pathlib import Path
+
+# Force UTF-8 sur stdout/stderr (evite UnicodeEncodeError sur Windows cp1252)
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+else:
+    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
+    sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding="utf-8", errors="replace")
 
 import numpy as np
 import pandas as pd
@@ -41,13 +50,13 @@ FEATURE_GROUPS = {
 # Helpers
 # ---------------------------------------------------------------------------
 
-def sep(char="─", width=70):
+def sep(char="-", width=70):
     print(char * width)
 
 def header(title: str):
-    sep("═")
+    sep("=")
     print(f"  {title}")
-    sep("═")
+    sep("=")
 
 def section(title: str):
     print()
@@ -293,7 +302,7 @@ def analyse_processed(ep_id: str, ep_dir: Path, meta: dict):
 # ---------------------------------------------------------------------------
 
 def global_summary(episodes: list[tuple[str, dict, pd.DataFrame | None]]):
-    header("RÉSUMÉ GLOBAL")
+    header("RESUME GLOBAL")
 
     rows = []
     for ep_id, meta, df_proc in episodes:
@@ -366,7 +375,7 @@ def global_summary(episodes: list[tuple[str, dict, pd.DataFrame | None]]):
               f"{n_train:>12,}  {n_val:>10,}  {n_test:>10,}  "
               f"{f60_train:>10}  {f60_test:>10}")
 
-    sep("─")
+    sep("-")
     grand_total = train_total + val_total + test_total
     print(f"  {'TOTAL':<10} {'':<14} {grand_total:>8,}  "
           f"{train_total:>12,}  {val_total:>10,}  {test_total:>10,}")
@@ -393,7 +402,7 @@ def main():
     do_raw = not args.processed_only
     do_processed = not args.raw_only
 
-    header("JUSTE DES VENTILATEURS — Quick EDA")
+    header("JUSTE DES VENTILATEURS -- Quick EDA")
 
     # Lister les épisodes disponibles
     raw_eps = {p.name.replace("episode=", ""): p

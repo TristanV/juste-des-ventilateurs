@@ -161,13 +161,24 @@ Split sur 6 épisodes (304k lignes, 47 features) :
   - **Lead time** : temps moyen entre première alerte et incident (fenêtre 120s)
   - Taux de faux négatifs sur shutdowns
   - Tableau comparatif + export JSON
-- [ ] Sauvegarde et chargement des modèles : `models/failure_prediction/saved/`
-- [ ] Notebook : `notebooks/03_failure_prediction.ipynb`
+- [x] Sauvegarde des modèles : `models/failure_prediction/saved/` (joblib)
+- [x] Notebook : `notebooks/03_failure_prediction.ipynb`
 
 ### Métriques cibles
 - Recall sur cas dangereux ≥ 0.85
 - Temps moyen d'anticipation ≥ 30s avant incident
 - F1-score > baseline heuristique
+
+### Résultats obtenus (6 épisodes, 304k lignes, 47 features)
+
+| Modèle | F1 | Recall | PR-AUC | Lead time médian | Détectés |
+|--------|----|--------|--------|------------------|---------|
+| baseline | 0.141 | 0.130 | 0.171 | 8.7s | 10/14 |
+| logistic | 0.851 | 0.930 | 0.812 | 72s | **12/14** |
+| random_forest | 0.877 | 0.930 | 0.759 | 5876s | 4/14 |
+| gradient_boosting | **0.877** | **0.931** | 0.757 | 5876s | 4/14 |
+
+**Recommandation Phase 6 :** régression logistique (meilleur taux de détection 12/14, PR-AUC supérieur).
 
 ### Livrables ✅
 - `models/failure_prediction/splitter.py`
@@ -175,7 +186,10 @@ Split sur 6 épisodes (304k lignes, 47 features) :
 - `models/failure_prediction/logistic_regression.py`
 - `models/failure_prediction/random_forest.py`
 - `models/failure_prediction/gradient_boosting.py`
+- `models/failure_prediction/saved/` (4 modèles joblib)
 - `evaluation/failure_prediction_eval.py`
+- `evaluation/results/failure_prediction_results_failure_60s.json`
+- `notebooks/03_failure_prediction.ipynb`
 - `train_models.bat`
 
 ### Commandes
