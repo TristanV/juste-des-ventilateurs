@@ -34,12 +34,13 @@ Phase 6 : Boucle fermée & éval   [Semaine 5-6]
   - Topics : `.../telemetry` (QoS 0, 1/s), `.../status` (QoS 1), `.../fault` (QoS 1), `.../summary` (QoS 1)
 - [x] Analyse des endpoints REST de pilotage des ventilateurs
 - [x] Identification des seuils thermiques par rôle (base.yaml)
-- [ ] `notebooks/01_exploration.ipynb` : exploration MQTT et API interactive
+- [x] `notebooks/01_ingestion_eda.ipynb` : exploration des données brutes et comparaison des scénarios
 
 ### Livrables ✅
 - Structure du projet, Docker, supervisor placeholder
 - `documents/roadmap.md`, `documents/specifications.md`, `README.md`
 - `.env.example`, `build-clean-app.bat`
+- `notebooks/01_ingestion_eda.ipynb`
 
 ---
 
@@ -60,7 +61,7 @@ Phase 6 : Boucle fermée & éval   [Semaine 5-6]
   - `metadata.json` par épisode (scenario, seed, durée, n_records)
 - [x] `tests/test_ingest.py` : 19 tests unitaires (Normalizer + DatasetExporter)
 - [x] `data/schema.md` : schéma unifié documenté
-- [ ] `notebooks/01_exploration.ipynb` : collecte interactive et visualisation
+- [x] `notebooks/01_ingestion_eda.ipynb` : exploration interactive des données brutes
 
 ### Livrables ✅
 - `ingest/mqtt_subscriber.py`, `ingest/normalizer.py`, `ingest/dataset_exporter.py`
@@ -95,12 +96,13 @@ python -m ingest.mqtt_subscriber --continuous --episode 001 --scenario stress
 - [x] `features/labeler.py` : failure_60s / failure_30s / hot_30s (forward-looking), time_to_failure_s, optimal_rpm / action_class
 - [x] `features/pipeline.py` : pipeline complet CLI, traitement multi-machine, export Parquet
 - [x] `tests/test_features.py` : 28 tests unitaires
-- [ ] `notebooks/02_feature_analysis.ipynb` : analyse exploratoire interactive
+- [x] `notebooks/02_feature_engineering.ipynb` : distributions, corrélations, split temporel
 
 ### Livrables ✅
 - `features/temporal.py`, `features/contextual.py`, `features/energy.py`
 - `features/labeler.py`, `features/pipeline.py`
 - `tests/test_features.py`
+- `notebooks/02_feature_engineering.ipynb`
 
 ### Commandes
 ```bash
@@ -241,7 +243,7 @@ Actions discrétisées : `RPM ∈ {0, 1500, 2500, 3500, 4500}` par ventilateur.
 - [x] **Évaluation comparative** (`evaluation/fan_control_eval.py`)
   - Métriques : mean_rpm, T_mean, %temps_critique, action_accuracy, rpm_mae, high_rpm_when_dangerous
   - risk_scores fournis par le prédicteur logistic (Phase 4)
-- [ ] Notebook : `notebooks/04_fan_control.ipynb`
+- [x] Notebook : `notebooks/04_fan_control.ipynb`
 
 ### Métriques cibles
 - Réduction du nombre de shutdowns vs baseline auto native ≥ 50%
@@ -256,6 +258,7 @@ Actions discrétisées : `RPM ∈ {0, 1500, 2500, 3500, 4500}` par ventilateur.
 - `evaluation/fan_control_eval.py`
 - `train_fan_controllers.bat`
 - `tests/test_phase5_controllers.py`
+- `notebooks/04_fan_control.ipynb`
 
 ### Commandes
 ```bash
