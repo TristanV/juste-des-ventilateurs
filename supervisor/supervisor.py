@@ -92,43 +92,53 @@ class JumeauxClient:
         """GET /machines/{id} — état d'une machine."""
         return self._get(f"/machines/{machine_id}")
 
-    def set_fan_speed(self, machine_id: str, rpm: int) -> bool:
-        """PUT /machines/{id}/fan_speed — fixe le RPM d'un ventilateur."""
-        try:
-            url  = f"{self.base_url}/machines/{machine_id}/fan_speed"
-            body = {"rpm": rpm}
-            if self._client is not None:
-                resp = self._client.put(url, json=body)
-                return resp.status_code < 300
-            else:
-                import json, urllib.request
-                data = json.dumps(body).encode()
-                req  = urllib.request.Request(url, data=data, method="PUT",
-                                              headers={"Content-Type": "application/json"})
-                with urllib.request.urlopen(req, timeout=self.timeout) as r:
-                    return r.status < 300
-        except Exception as e:
-            logger.warning(f"set_fan_speed({machine_id}, {rpm}) échoué : {e}")
-            return False
+    def set_fan_speed(self, machine_id: str, rpm: int, fan_indices: list[int] | None = None) -> bool:
+        """PUT /machines/{id}/fan_speed — fixe le RPM sur tous les fans (fan_idx requis par l'API)."""
+        if fan_indices is None:
+            fan_indices = [0, 1]  # 2 fans par machine par défaut
+        ok = True
+        for idx in fan_indices:
+            try:
+                url  = f"{self.base_url}/machines/{machine_id}/fan_speed"
+                body = {"fan_idx": idx, "rpm": rpm}
+                if self._client is not None:
+                    resp = self._client.put(url, json=body)
+                    ok = ok and resp.status_code < 300
+                else:
+                    import json, urllib.request
+                    data = json.dumps(body).encode()
+                    req  = urllib.request.Request(url, data=data, method="PUT",
+                                                  headers={"Content-Type": "application/json"})
+                    with urllib.request.urlopen(req, timeout=self.timeout) as r:
+                        ok = ok and r.status < 300
+            except Exception as e:
+                logger.warning(f"set_fan_speed({machine_id}, fan={idx}, {rpm}) échoué : {e}")
+                ok = False
+        return ok
 
-    def set_fan_mode(self, machine_id: str, mode: str) -> bool:
-        """PUT /machines/{id}/fan_mode — mode auto/manual."""
-        try:
-            url  = f"{self.base_url}/machines/{machine_id}/fan_mode"
-            body = {"mode": mode}
-            if self._client is not None:
-                resp = self._client.put(url, json=body)
-                return resp.status_code < 300
-            else:
-                import json, urllib.request
-                data = json.dumps(body).encode()
-                req  = urllib.request.Request(url, data=data, method="PUT",
-                                              headers={"Content-Type": "application/json"})
-                with urllib.request.urlopen(req, timeout=self.timeout) as r:
-                    return r.status < 300
-        except Exception as e:
-            logger.warning(f"set_fan_mode({machine_id}, {mode}) échoué : {e}")
-            return False
+    def set_fan_mode(self, machine_id: str, mode: str, fan_indices: list[int] | None = None) -> bool:
+        """PUT /machines/{id}/fan_mode — mode auto/manual sur tous les fans."""
+        if fan_indices is None:
+            fan_indices = [0, 1]
+        ok = True
+        for idx in fan_indices:
+            try:
+                url  = f"{self.base_url}/machines/{machine_id}/fan_mode"
+                body = {"fan_idx": idx, "mode": mode}
+                if self._client is not None:
+                    resp = self._client.put(url, json=body)
+                    ok = ok and resp.status_code < 300
+                else:
+                    import json, urllib.request
+                    data = json.dumps(body).encode()
+                    req  = urllib.request.Request(url, data=data, method="PUT",
+                                                  headers={"Content-Type": "application/json"})
+                    with urllib.request.urlopen(req, timeout=self.timeout) as r:
+                        ok = ok and r.status < 300
+            except Exception as e:
+                logger.warning(f"set_fan_mode({machine_id}, fan={idx}, {mode}) échoué : {e}")
+                ok = False
+        return ok
 
     def _get(self, path: str) -> dict:
         url = f"{self.base_url}{path}"
@@ -218,27 +228,41 @@ def snapshot_to_series(snapshot: dict) -> "pd.Series":
     sensors = snapshot.get("sensors", {})
     fans    = snapshot.get("fans", {})
 
-    # Moyenne RPM depuis dict {fan_id: {"rpm": X}}
-    rpms = [v.get("rpm", 0) for v in fans.values() if isinstance(v, dict)]
+    # Fans : liste [{idx, rpm, mode}] OU dict {fan_id: {rpm, mode}}
+    if isinstance(fans, list):
+        rpms = [f.get("rpm", 0) for f in fans if isinstance(f, dict)]
+    else:
+        rpms = [v.get("rpm", 0) for v in fans.values() if isinstance(v, dict)]
     fan_rpm_mean = float(np.mean(rpms)) if rpms else 0.0
 
+    # Sensors : {"temp_cpu": {"temp_c": X}, ...} OU {"temp_max": X, ...}
+    def _sensor_val(key_nested: str, key_flat: str, default: float) -> float:
+        """Extrait une valeur de sensor quel que soit le format."""
+        if key_nested in sensors and isinstance(sensors[key_nested], dict):
+            return float(sensors[key_nested].get("temp_c", default))
+        return float(sensors.get(key_flat, default))
+
+    temp_c   = float(snapshot.get("temperature_c", 60.0))
+    temp_max  = _sensor_val("temp_cpu",     "temp_max",  temp_c)
+    temp_mean = _sensor_val("temp_chassis", "temp_mean", temp_c)
+
     row = {
-        "temperature_c":    float(snapshot.get("temperature_c", 60.0)),
-        "sensor_temp_max":  float(sensors.get("temp_max", snapshot.get("temperature_c", 60.0))),
-        "sensor_temp_mean": float(sensors.get("temp_mean", snapshot.get("temperature_c", 60.0))),
-        "power_w":          float(snapshot.get("power_w", 0.0)),
-        "energy_kwh":       float(snapshot.get("energy_kwh", 0.0)),
+        "temperature_c":    temp_c,
+        "sensor_temp_max":  temp_max,
+        "sensor_temp_mean": temp_mean,
+        "power_w":          float(snapshot.get("power_w", snapshot.get("power_watts", 0.0))),
+        "energy_kwh":       float(snapshot.get("energy_kwh", snapshot.get("energy_kwh_cumulated", 0.0))),
         "fan_rpm_mean":     fan_rpm_mean,
-        "load_estimated":   float(snapshot.get("load_estimated", 0.5)),
+        "load_estimated":   float(snapshot.get("load_estimated", snapshot.get("load", 0.5))),
         # Features rolling non disponibles online → approx avec valeur courante
         "temp_delta_5s":                0.0,
         "temp_delta_15s":               0.0,
         "temp_delta_30s":               0.0,
-        "temp_rolling_mean_30s":        float(snapshot.get("temperature_c", 60.0)),
-        "temp_rolling_mean_60s":        float(snapshot.get("temperature_c", 60.0)),
+        "temp_rolling_mean_30s":        temp_c,
+        "temp_rolling_mean_60s":        temp_c,
         "temp_rolling_std_30s":         0.0,
-        "margin_to_shutdown":           float(snapshot.get("t_shutdown_c", 88.0)) - float(snapshot.get("temperature_c", 60.0)),
-        "margin_pct":                   max(0.0, (float(snapshot.get("t_shutdown_c", 88.0)) - float(snapshot.get("temperature_c", 60.0))) / float(snapshot.get("t_shutdown_c", 88.0))),
+        "margin_to_shutdown":           88.0 - temp_c,  # t_shutdown fixe 88°C
+        "margin_pct":                   max(0.0, (88.0 - temp_c) / 88.0),
         "margin_delta_30s":             0.0,
         "load_rolling_mean_30s":        float(snapshot.get("load_estimated", 0.5)),
         "load_rolling_mean_60s":        float(snapshot.get("load_estimated", 0.5)),
@@ -247,7 +271,7 @@ def snapshot_to_series(snapshot: dict) -> "pd.Series":
         "power_rolling_mean_30s":       float(snapshot.get("power_w", 0.0)),
         "power_delta_30s":              0.0,
         "sensor_max_delta_15s":         0.0,
-        "sensor_max_rolling_mean_30s":  float(sensors.get("temp_max", snapshot.get("temperature_c", 60.0))),
+        "sensor_max_rolling_mean_30s":  temp_max,
         "power_fans_rolling_mean_30s":  0.0,
         "pue_rolling_mean_30s":         1.0,
         "time_in_hot_zone_s":           0.0,
@@ -393,7 +417,8 @@ class Supervisor:
 
         if rpm >= 0 and rpm != prev_rpm:
             if not self.dry_run:
-                ok = self.client.set_fan_speed(machine_id, rpm)
+                fan_indices = self._fan_indices(snapshot)
+                ok = self.client.set_fan_speed(machine_id, rpm, fan_indices=fan_indices)
                 entry["command_sent"] = ok
             else:
                 entry["command_sent"] = None  # dry_run
@@ -417,10 +442,17 @@ class Supervisor:
             logger.warning("cluster/status vide — skip cycle")
             return []
 
-        machines_data = cluster.get("machines", {})
-        if not machines_data:
+        machines_raw = cluster.get("machines", {})
+        if not machines_raw:
             logger.warning("Aucune machine dans le cluster — skip cycle")
             return []
+
+        # Normaliser : l'API peut retourner un dict {id: snap} ou une liste [{machine_id, ...}]
+        if isinstance(machines_raw, list):
+            machines_data = {m.get("machine_id", m.get("id", f"machine_{i}")): m
+                             for i, m in enumerate(machines_raw)}
+        else:
+            machines_data = machines_raw
 
         results = []
         for machine_id, snapshot in machines_data.items():
@@ -468,19 +500,28 @@ class Supervisor:
             self.dec_logger.close()
             logger.info(f"=== Supervisor arrêté après {cycle} cycles ===")
 
+    def _fan_indices(self, snapshot: dict) -> list[int]:
+        """Retourne la liste des indices de fans d'une machine depuis son snapshot."""
+        fans = snapshot.get("fans", [])
+        if isinstance(fans, list):
+            return [f["idx"] for f in fans if "idx" in f]
+        return list(range(len(fans))) if fans else [0, 1]
+
     def _set_all_manual(self) -> None:
         """Passe toutes les machines en mode manual fan."""
         cluster = self.client.get_cluster_status()
-        for machine_id in cluster.get("machines", {}):
-            self.client.set_fan_mode(machine_id, "manual")
-            logger.info(f"  {machine_id} → mode manual")
+        for machine_id, snapshot in cluster.get("machines", {}).items():
+            indices = self._fan_indices(snapshot)
+            self.client.set_fan_mode(machine_id, "manual", fan_indices=indices)
+            logger.info(f"  {machine_id} → mode manual (fans {indices})")
 
     def _set_all_auto(self) -> None:
         """Repasse toutes les machines en mode auto fan."""
         cluster = self.client.get_cluster_status()
-        for machine_id in cluster.get("machines", {}):
-            self.client.set_fan_mode(machine_id, "auto")
-            logger.info(f"  {machine_id} → mode auto")
+        for machine_id, snapshot in cluster.get("machines", {}).items():
+            indices = self._fan_indices(snapshot)
+            self.client.set_fan_mode(machine_id, "auto", fan_indices=indices)
+            logger.info(f"  {machine_id} → mode auto (fans {indices})")
 
 
 # ---------------------------------------------------------------------------
@@ -527,4 +568,4 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main
+    main()
