@@ -284,31 +284,66 @@ pytest tests/test_phase5_controllers.py -v -m "not slow"
 
 ### Tâches
 
-- [ ] **Service de supervision** (`supervisor/supervisor.py`)
-  - Boucle : lire état MQTT → évaluer risque (modèle prédictif) → décider action (contrôleur) → envoyer commande REST → logger
-  - Fréquence de décision configurable (ex: toutes les 5s)
-  - Passage des machines en mode `manual` avant activation du contrôleur
-  - L'arrêt thermique automatique reste ACTIF (événement d'échec à éviter)
-- [ ] **Logger de décisions** (`supervisor/decision_logger.py`)
-  - Enregistrement de : timestamp, machine, état, risque prédit, action choisie, résultat observé
-- [ ] **Protocole d'évaluation** (`evaluation/benchmark.py`)
-  - Scénario unique, durée fixe, plusieurs runs :
-    1. **Baseline native** : mode auto jumeaux-chauds, aucune intervention
-    2. **Baseline seuils** : contrôleur à seuils externe
-    3. **Couple ML** : prédicteur + contrôleur à score
-  - Métriques globales : nb shutdowns, T_mean, T_max, énergie totale, énergie fans
-- [ ] **Test de robustesse** (`evaluation/robustness.py`)
-  - Variation de charge, bruit capteur augmenté, drift rapide, pannes fréquentes
-  - Généralisation : tester sur scénarios `nominal`, `stress`, `heatwave`, `busy_weeks`
-- [ ] **Rapport final** (`documents/rapport_analyse.md`)
-  - Résultats chiffrés, graphiques comparatifs, analyse critique
-- [ ] Notebook final : `notebooks/05_evaluation_comparative.ipynb`
+- [x] **Service de supervision** (`supervisor/supervisor.py`)
+  - Boucle : lire état REST → évaluer risque (prédicteur logistic) → décider RPM (contrôleur supervisé) → envoyer commande REST → logger
+  - Fréquence de décision configurable (défaut 5s)
+  - Modes : `ml` | `threshold` | `native`
+  - Override automatique RPM_HIGH si risk_score >= 0.60
+  - Passage en mode `manual` avant prise de main, retour `auto` à l'arrêt
+- [x] **Logger de décisions** (`supervisor/decision_logger.py`)
+  - Format JSONL : timestamp, machine_id, temperature_c, risk_score, rpm_decided, rpm_previous, mode, risk_override
+  - `to_dataframe()` pour chargement dans les notebooks
+- [x] **Protocole d'évaluation** (`evaluation/benchmark.py`)
+  - 3 modes comparés sur le jeu de test offline :
+    1. **native** : RPM oracle du simulateur, aucune intervention
+    2. **threshold** : contrôleur à seuils externe
+    3. **ml** : prédicteur logistic + contrôleur supervisé (recommandé)
+  - Métriques : mean_rpm, T_mean, T_max, %critique, action_accuracy, lead_time, détection incidents
+- [x] **Test de robustesse** (`evaluation/robustness.py`)
+  - Évaluation par scénario (basic, busy_weeks, heatwave, nominal, stress, trace_replay)
+  - Comparaison ML vs natif : delta_rpm, delta_power, react_rate
+- [x] **Rapport final** (`documents/rapport_analyse.md`)
+  - Résultats chiffrés, analyse critique, recommandations
+- [x] Notebook final : `notebooks/05_evaluation_comparative.ipynb`
 
-### Livrables
-- `supervisor/` : service de supervision temps réel
-- `evaluation/` : protocole complet et résultats
+### Résultats Phase 6 (offline replay, failure_60s)
+
+| Mode | MeanRPM | AccAct | DangHigh | LeadTime médian | Incidents détectés |
+|------|---------|--------|----------|-----------------|-------------------|
+| native | 984 | 0.200 | 0.000 | 0s | 0/7986 |
+| threshold | 1815 | 0.417 | 0.105 | 0s | 0/7986 |
+| **ml** | **2681** | **0.786** | **1.000** | **120s** | **7981/7986** |
+
+### Livrables ✅
+- `supervisor/supervisor.py` : service de supervision temps réel
+- `supervisor/decision_logger.py` : logger JSONL
+- `evaluation/benchmark.py` : benchmark comparatif 3 modes
+- `evaluation/robustness.py` : test robustesse par scénario
+- `evaluation/results/benchmark_results.json`
+- `evaluation/results/robustness_results.json`
 - `documents/rapport_analyse.md`
 - `notebooks/05_evaluation_comparative.ipynb`
+- `run_phase6.bat`
+- `tests/test_phase6_supervisor.py`
+
+### Commandes
+```bash
+# Evaluation comparative offline (recommande)
+run_phase6.bat
+
+# Benchmark seul
+python -m evaluation.benchmark --label failure_60s
+
+# Robustesse par scenario
+python -m evaluation.robustness --label failure_60s
+
+# Supervisor temps reel (jumeaux-chauds doit tourner)
+python -m supervisor.supervisor --mode ml --duration 300 --dry-run
+python -m supervisor.supervisor --mode ml --duration 300
+
+# Tests
+pytest tests/test_phase6_supervisor.py -v -m "not slow"
+```
 
 ---
 
