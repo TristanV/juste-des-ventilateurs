@@ -8,11 +8,14 @@ services:
       context: .
       dockerfile: Dockerfile
     env_file: .env
+    environment:
+      # Sur Docker Desktop Windows, network_mode:host est ignore.
+      # host.docker.internal pointe vers l'hote Windows (jumeaux-chauds API).
+      - API_BASE_URL=http://host.docker.internal:8000
     volumes:
       - ./data:/app/data
       - ./models:/app/models
       - ./supervisor/logs:/app/supervisor/logs
-    network_mode: host   # rejoindre le réseau de jumeaux-chauds (MQTT :1883, API :8000)
     restart: "no"
     command: python -m supervisor.supervisor
 
