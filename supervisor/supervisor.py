@@ -1,13 +1,15 @@
 """Superviseur de régulation thermique — Juste des Ventilateurs.
 
 Boucle principale de décision en temps réel :
-  1. Lire l'état du cluster via REST (GET /cluster/status)
-  2. Pour chaque machine active : extraire les features online
-  3. Évaluer le risque de panne (prédicteur logistic ou autre)
-  4. Décider la consigne RPM (contrôleur supervisé ou autre)
-  5. Appliquer un override si risk_score > risk_threshold
-  6. Envoyer la commande via REST (PUT /machines/{id}/fan_speed)
-  7. Logger la décision
+  1. Recevoir la télémétrie via MQTT (consumer asyncio) → OnlineFeatureBuffer
+  2. Tous les decision_interval_ticks ticks simulés :
+     a. Extraire les features enrichies (fenêtres glissantes)
+     b. Évaluer le risque de panne (prédicteur logistique)
+     c. Décider la consigne RPM (contrôleur supervisé)
+     d. Override RPM_HIGH si risk_score >= RISK_THRESHOLD
+     e. Envoyer la commande via REST (PUT /machines/{id}/fan_speed)
+     f. Logger la décision
+  3. Fallback : si MQTT indisponible, lire GET /cluster/status REST
 
 Ce module peut aussi être utilisé en mode "offline replay" pour
 rejouer un dataset et comparer les décisions du superviseur avec
@@ -21,6 +23,7 @@ Usage :
 from __future__ import annotations
 
 import argparse
+import asyncio
 import logging
 import os
 import sys
@@ -37,24 +40,34 @@ sys.path.insert(0, str(ROOT))
 from supervisor.decision_logger import DecisionLogger
 from supervisor.online_features import OnlineFeatureBuffer
 
+# ---------------------------------------------------------------------------
+# Configuration des logs — silencer httpx, reformater le superviseur
+# ---------------------------------------------------------------------------
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s — %(message)s",
 )
 logger = logging.getLogger("supervisor")
 
+# httpx est très verbeux (une ligne par requête HTTP 200) — passer en WARNING
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
+
 # ---------------------------------------------------------------------------
 # Constantes
 # ---------------------------------------------------------------------------
 
 RPM_LEVELS     = [0, 1500, 2500, 3500, 4500]
-RPM_HIGH       = 4500   # RPM d'urgence quand risk_score > threshold
-RPM_DEFAULT    = 2500   # RPM de sécurité si aucune décision possible
-RPM_MIN        = 800    # Plancher : ventilation minimale même à froid
-RISK_THRESHOLD = 0.60   # Seuil de surcharge risque → RPM_HIGH
+RPM_HIGH       = 4500    # RPM d'urgence quand risk_score > threshold
+RPM_DEFAULT    = 2500    # RPM de sécurité si aucune décision possible
+RPM_MIN        = 800     # Plancher : ventilation minimale même à froid
+RISK_THRESHOLD = 0.60    # Seuil de surcharge risque → RPM_HIGH
 
-# Features attendues par le prédicteur (doit correspondre aux 47 features du splitter)
-# On utilise un sous-ensemble disponible dans l'état REST
+# Seuil de risk_score à partir duquel on logue une machine en INFO
+RISK_LOG_THRESHOLD = float(os.environ.get("RISK_LOG_THRESHOLD", "0.05"))
+
+# Features attendues par le prédicteur — sous-ensemble disponible online
 ONLINE_FEATURES = [
     "temperature_c", "sensor_temp_max", "sensor_temp_mean",
     "power_w", "energy_kwh", "fan_rpm_mean",
@@ -67,13 +80,7 @@ ONLINE_FEATURES = [
 # ---------------------------------------------------------------------------
 
 class JumeauxClient:
-    """Client REST léger vers l'API jumeaux-chauds.
-
-    Parameters
-    ----------
-    base_url : URL de base de l'API (ex: "http://localhost:8000")
-    timeout  : timeout HTTP en secondes
-    """
+    """Client REST léger vers l'API jumeaux-chauds."""
 
     def __init__(self, base_url: str = "http://localhost:8000", timeout: float = 5.0) -> None:
         self.base_url = base_url.rstrip("/")
@@ -82,22 +89,20 @@ class JumeauxClient:
             import httpx
             self._client = httpx.Client(timeout=timeout)
         except ImportError:
-            import urllib.request
             self._client = None
-        logger.info(f"JumeauxClient → {self.base_url}")
+        logger.info("JumeauxClient → %s", self.base_url)
 
     def get_cluster_status(self) -> dict:
-        """GET /cluster/status — état complet du cluster."""
         return self._get("/cluster/status")
 
-    def get_machine(self, machine_id: str) -> dict:
-        """GET /machines/{id} — état d'une machine."""
-        return self._get(f"/machines/{machine_id}")
+    def get_speed_multiplier(self) -> float:
+        """Lit le speed_multiplier courant depuis /cluster/status."""
+        status = self._get("/cluster/status")
+        return float(status.get("speed_multiplier", 1.0))
 
     def set_fan_speed(self, machine_id: str, rpm: int, fan_indices: list[int] | None = None) -> bool:
-        """PUT /machines/{id}/fan_speed — fixe le RPM sur tous les fans (fan_idx requis par l'API)."""
         if fan_indices is None:
-            fan_indices = [0, 1]  # 2 fans par machine par défaut
+            fan_indices = [0, 1]
         ok = True
         for idx in fan_indices:
             try:
@@ -107,19 +112,18 @@ class JumeauxClient:
                     resp = self._client.put(url, json=body)
                     ok = ok and resp.status_code < 300
                 else:
-                    import json, urllib.request
-                    data = json.dumps(body).encode()
+                    import json as _json, urllib.request
+                    data = _json.dumps(body).encode()
                     req  = urllib.request.Request(url, data=data, method="PUT",
                                                   headers={"Content-Type": "application/json"})
                     with urllib.request.urlopen(req, timeout=self.timeout) as r:
                         ok = ok and r.status < 300
             except Exception as e:
-                logger.warning(f"set_fan_speed({machine_id}, fan={idx}, {rpm}) échoué : {e}")
+                logger.warning("set_fan_speed(%s, fan=%d, %d) échoué : %s", machine_id, idx, rpm, e)
                 ok = False
         return ok
 
     def set_fan_mode(self, machine_id: str, mode: str, fan_indices: list[int] | None = None) -> bool:
-        """PUT /machines/{id}/fan_mode — mode auto/manual sur tous les fans."""
         if fan_indices is None:
             fan_indices = [0, 1]
         ok = True
@@ -131,14 +135,14 @@ class JumeauxClient:
                     resp = self._client.put(url, json=body)
                     ok = ok and resp.status_code < 300
                 else:
-                    import json, urllib.request
-                    data = json.dumps(body).encode()
+                    import json as _json, urllib.request
+                    data = _json.dumps(body).encode()
                     req  = urllib.request.Request(url, data=data, method="PUT",
                                                   headers={"Content-Type": "application/json"})
                     with urllib.request.urlopen(req, timeout=self.timeout) as r:
                         ok = ok and r.status < 300
             except Exception as e:
-                logger.warning(f"set_fan_mode({machine_id}, fan={idx}, {mode}) échoué : {e}")
+                logger.warning("set_fan_mode(%s, fan=%d, %s) échoué : %s", machine_id, idx, mode, e)
                 ok = False
         return ok
 
@@ -150,11 +154,11 @@ class JumeauxClient:
                 resp.raise_for_status()
                 return resp.json()
             else:
-                import json, urllib.request
+                import json as _json, urllib.request
                 with urllib.request.urlopen(url, timeout=self.timeout) as r:
-                    return json.loads(r.read())
+                    return _json.loads(r.read())
         except Exception as e:
-            logger.warning(f"GET {path} échoué : {e}")
+            logger.warning("GET %s échoué : %s", path, e)
             return {}
 
     def close(self) -> None:
@@ -170,148 +174,68 @@ class JumeauxClient:
 # ---------------------------------------------------------------------------
 
 def load_predictor(model_name: str = "logistic", label: str = "failure_60s"):
-    """Charge le prédicteur de pannes sauvegardé."""
     import joblib as _joblib
     saved_path = ROOT / "models" / "failure_prediction" / "saved" / f"{model_name}_{label}.joblib"
     if not saved_path.exists():
-        logger.warning(f"Prédicteur absent : {saved_path}. risk_score=0 partout.")
+        logger.warning("Prédicteur absent : %s. risk_score=0 partout.", saved_path)
         return None
     from models.failure_prediction.logistic_regression import LogisticPredictor
     predictor = LogisticPredictor()
-    # Chargement defensif : compatibilite format dict ou pipeline direct
     raw = _joblib.load(str(saved_path))
-    logger.info(f"  joblib type={type(raw).__name__}  keys={list(raw.keys()) if isinstance(raw, dict) else 'n/a'}")
     if isinstance(raw, dict):
-        # Chercher le pipeline sous les cles connues (pipeline, model, estimator...)
         pipeline_val = (raw.get("pipeline") or raw.get("model") or raw.get("estimator")
                         or next((v for v in raw.values() if hasattr(v, "predict_proba")), None))
         if pipeline_val is None:
-            raise KeyError(f"Aucun objet sklearn trouve dans le joblib. Cles: {list(raw.keys())}")
+            raise KeyError(f"Aucun objet sklearn dans le joblib. Clés: {list(raw.keys())}")
         predictor._pipeline = pipeline_val
         predictor.threshold = raw.get("threshold", predictor.threshold)
         predictor.C         = raw.get("C", predictor.C)
     else:
         predictor._pipeline = raw
-    logger.info(f"Prédicteur chargé : {saved_path.name}")
+    logger.info("Prédicteur chargé : %s", saved_path.name)
     return predictor
 
 
 def load_controller(model_name: str = "supervised"):
-    """Charge le contrôleur de ventilateurs sauvegardé."""
     saved_dir = ROOT / "models" / "fan_control" / "saved"
-    if model_name == "supervised":
-        path = saved_dir / "supervised.joblib"
-        if not path.exists():
-            logger.warning(f"Contrôleur absent : {path}. RPM_DEFAULT utilisé.")
-            return None
-        from models.fan_control.supervised_controller import SupervisedController
-        ctrl = SupervisedController.load(str(path))
-    elif model_name == "score_controller":
-        path = saved_dir / "score_controller.json"
-        if not path.exists():
-            logger.warning(f"Contrôleur absent : {path}. RPM_DEFAULT utilisé.")
-            return None
-        from models.fan_control.score_controller import ScoreController
-        ctrl = ScoreController.load(str(path))
-    elif model_name == "baseline_pid":
-        path = saved_dir / "baseline_pid.json"
-        if not path.exists():
-            logger.warning(f"Contrôleur absent : {path}. RPM_DEFAULT utilisé.")
-            return None
-        from models.fan_control.baseline_pid import PIDController
-        ctrl = PIDController.load(str(path))
-    elif model_name == "baseline_threshold":
-        path = saved_dir / "baseline_threshold.json"
-        if not path.exists():
-            logger.warning(f"Contrôleur absent : {path}. RPM_DEFAULT utilisé.")
-            return None
-        from models.fan_control.baseline_threshold import ThresholdFanController
-        ctrl = ThresholdFanController.load(str(path))
-    else:
-        logger.warning(f"Contrôleur inconnu : {model_name}. RPM_DEFAULT utilisé.")
+    paths = {
+        "supervised":          (saved_dir / "supervised.joblib",          "models.fan_control.supervised_controller", "SupervisedController", "load"),
+        "score_controller":    (saved_dir / "score_controller.json",       "models.fan_control.score_controller",      "ScoreController",      "load"),
+        "baseline_pid":        (saved_dir / "baseline_pid.json",           "models.fan_control.baseline_pid",          "PIDController",        "load"),
+        "baseline_threshold":  (saved_dir / "baseline_threshold.json",     "models.fan_control.baseline_threshold",    "ThresholdFanController","load"),
+    }
+    if model_name not in paths:
+        logger.warning("Contrôleur inconnu : %s. RPM_DEFAULT utilisé.", model_name)
         return None
-    logger.info(f"Contrôleur chargé : {path.name}")
+    path, mod, cls, meth = paths[model_name]
+    if not path.exists():
+        logger.warning("Contrôleur absent : %s. RPM_DEFAULT utilisé.", path)
+        return None
+    import importlib
+    m = importlib.import_module(mod)
+    ctrl = getattr(m, cls).load(str(path))
+    logger.info("Contrôleur chargé : %s", path.name)
     return ctrl
 
 
 # ---------------------------------------------------------------------------
-# Extraction des features online (depuis snapshot REST)
+# Helpers REST fallback (lecture cluster en mode sans MQTT)
 # ---------------------------------------------------------------------------
 
-def snapshot_to_series(snapshot: dict) -> "pd.Series":
-    """Transforme un snapshot REST machine en pd.Series compatible features."""
-    import pandas as pd
+def _machines_from_cluster(cluster: dict) -> dict[str, dict]:
+    """Normalise machines dict ou liste → {machine_id: snapshot}."""
+    machines_raw = cluster.get("machines", {})
+    if isinstance(machines_raw, list):
+        return {m.get("machine_id", m.get("id", f"machine_{i}")): m
+                for i, m in enumerate(machines_raw)}
+    return machines_raw
 
-    sensors = snapshot.get("sensors", {})
-    fans    = snapshot.get("fans", {})
 
-    # Fans : liste [{idx, rpm, mode}] OU dict {fan_id: {rpm, mode}}
+def _fan_indices(snapshot: dict) -> list[int]:
+    fans = snapshot.get("fans", [])
     if isinstance(fans, list):
-        rpms = [f.get("rpm", 0) for f in fans if isinstance(f, dict)]
-    else:
-        rpms = [v.get("rpm", 0) for v in fans.values() if isinstance(v, dict)]
-    fan_rpm_mean = float(np.mean(rpms)) if rpms else 0.0
-
-    # Sensors : {"temp_cpu": {"temp_c": X}, ...} OU {"temp_max": X, ...}
-    def _sensor_val(key_nested: str, key_flat: str, default: float) -> float:
-        """Extrait une valeur de sensor quel que soit le format."""
-        if key_nested in sensors and isinstance(sensors[key_nested], dict):
-            return float(sensors[key_nested].get("temp_c", default))
-        return float(sensors.get(key_flat, default))
-
-    temp_c   = float(snapshot.get("temperature_c", 60.0))
-    temp_max  = _sensor_val("temp_cpu",     "temp_max",  temp_c)
-    temp_mean = _sensor_val("temp_chassis", "temp_mean", temp_c)
-
-    row = {
-        "temperature_c":    temp_c,
-        "sensor_temp_max":  temp_max,
-        "sensor_temp_mean": temp_mean,
-        "power_w":          float(snapshot.get("power_w", snapshot.get("power_watts", 0.0))),
-        "energy_kwh":       float(snapshot.get("energy_kwh", snapshot.get("energy_kwh_cumulated", 0.0))),
-        "fan_rpm_mean":     fan_rpm_mean,
-        "load_estimated":   float(snapshot.get("load_estimated", snapshot.get("load", 0.5))),
-        # Features rolling non disponibles online → approx avec valeur courante
-        "temp_delta_5s":                0.0,
-        "temp_delta_15s":               0.0,
-        "temp_delta_30s":               0.0,
-        "temp_rolling_mean_30s":        temp_c,
-        "temp_rolling_mean_60s":        temp_c,
-        "temp_rolling_std_30s":         0.0,
-        "margin_to_shutdown":           88.0 - temp_c,  # t_shutdown fixe 88°C
-        "margin_pct":                   max(0.0, (88.0 - temp_c) / 88.0),
-        "margin_delta_30s":             0.0,
-        "load_rolling_mean_30s":        float(snapshot.get("load_estimated", 0.5)),
-        "load_rolling_mean_60s":        float(snapshot.get("load_estimated", 0.5)),
-        "rpm_delta_15s":                0.0,
-        "rpm_rolling_mean_30s":         fan_rpm_mean,
-        "power_rolling_mean_30s":       float(snapshot.get("power_w", 0.0)),
-        "power_delta_30s":              0.0,
-        "sensor_max_delta_15s":         0.0,
-        "sensor_max_rolling_mean_30s":  temp_max,
-        "power_fans_rolling_mean_30s":  0.0,
-        "pue_rolling_mean_30s":         1.0,
-        "time_in_hot_zone_s":           0.0,
-        "nb_shutdowns_episode":         0,
-        "nb_degraded_episode":          0,
-        "ticks_since_last_shutdown":    9999,
-        "has_fan_fault":                0,
-        "has_power_surge":              0,
-        "ticks_since_last_fault":       9999,
-        "is_recovering":                0,
-        "power_fans_w":                 0.0,
-        "fan_energy_ratio":             0.0,
-        "pue_estimated":                1.0,
-        "energy_fans_kwh_cumulated":    0.0,
-        # Contexte épisode (non disponible online)
-        "time_in_degraded_s":           0.0,
-        "time_to_failure_s":            999.0,
-        "fan_count":                    len(fans),
-        "fan_rpm_std":                  float(np.std(rpms)) if len(rpms) > 1 else 0.0,
-        "fault_count":                  0,
-    }
-    import pandas as pd
-    return pd.Series(row)
+        return [f["idx"] for f in fans if "idx" in f]
+    return list(range(len(fans))) if fans else [0, 1]
 
 
 # ---------------------------------------------------------------------------
@@ -321,85 +245,103 @@ def snapshot_to_series(snapshot: dict) -> "pd.Series":
 _DEFAULT_LOG_DIR = Path(__file__).resolve().parent / "logs"
 
 
+def _DEFAULT_BROKER_HOST() -> str:
+    return os.environ.get("MQTT_BROKER_HOST", "localhost")
+
+def _DEFAULT_BROKER_PORT() -> int:
+    return int(os.environ.get("MQTT_BROKER_PORT", "1883"))
+
+def _DEFAULT_DECISION_INTERVAL() -> int:
+    return int(os.environ.get("DECISION_INTERVAL_TICKS", "5"))
+
+
 class Supervisor:
     """Superviseur temps réel couplant prédicteur + contrôleur.
 
     Parameters
     ----------
-    mode            : "ml" | "threshold" | "native"
-    predictor_name  : nom du modèle prédictif ("logistic", "random_forest", ...)
-    controller_name : nom du contrôleur ("supervised", "score_controller", ...)
-    label           : label de panne cible ("failure_60s" | "failure_30s")
-    risk_threshold  : seuil de surcharge risk_score → RPM_HIGH
-    api_url         : URL de l'API jumeaux-chauds
-    decision_interval_s : fréquence de décision (secondes)
-    log_dir         : répertoire des logs
-    run_name        : préfixe du fichier log
-    dry_run         : si True, ne pas envoyer les commandes REST
+    mode                    : "ml" | "threshold" | "native"
+    predictor_name          : nom du modèle prédictif
+    controller_name         : nom du contrôleur
+    label                   : label de panne cible
+    risk_threshold          : seuil risk_score → RPM_HIGH
+    api_url                 : URL de l'API jumeaux-chauds
+    mqtt_host / mqtt_port   : broker MQTT (Option E)
+    decision_interval_ticks : décision toutes les N ticks simulés (MQTT)
+    decision_interval_s     : intervalle fallback REST (secondes)
+    log_dir / run_name      : log JSONL
+    dry_run                 : ne pas envoyer de commandes REST
     """
 
     def __init__(
         self,
-        mode:                 str   = "ml",
-        predictor_name:       str   = "logistic",
-        controller_name:      str   = "supervised",
-        label:                str   = "failure_60s",
-        risk_threshold:       float = RISK_THRESHOLD,
-        api_url:              str   = "http://localhost:8000",
-        decision_interval_s:  float = 5.0,
-        log_dir:              str | Path = _DEFAULT_LOG_DIR,
-        run_name:             str   = "supervisor",
-        dry_run:              bool  = False,
+        mode:                    str   = "ml",
+        predictor_name:          str   = "logistic",
+        controller_name:         str   = "supervised",
+        label:                   str   = "failure_60s",
+        risk_threshold:          float = RISK_THRESHOLD,
+        api_url:                 str   = "http://localhost:8000",
+        mqtt_host:               str   = _DEFAULT_BROKER_HOST(),
+        mqtt_port:               int   = _DEFAULT_BROKER_PORT(),
+        decision_interval_ticks: int   = _DEFAULT_DECISION_INTERVAL(),
+        decision_interval_s:     float = 5.0,
+        log_dir:                 str | Path = _DEFAULT_LOG_DIR,
+        run_name:                str   = "supervisor",
+        dry_run:                 bool  = False,
     ) -> None:
-        self.mode                 = mode
-        self.label                = label
-        self.risk_threshold       = risk_threshold
-        self.decision_interval_s  = decision_interval_s
-        self.dry_run              = dry_run
+        self.mode                    = mode
+        self.label                   = label
+        self.risk_threshold          = risk_threshold
+        self.decision_interval_s     = decision_interval_s
+        self.decision_interval_ticks = decision_interval_ticks
+        self.dry_run                 = dry_run
 
         self.client     = JumeauxClient(api_url)
         self.dec_logger = DecisionLogger(log_dir=log_dir, run_name=run_name)
 
-        # Modèles (None si mode != "ml" ou si fichiers absents)
         self.predictor  = load_predictor(predictor_name, label) if mode == "ml" else None
-        self.controller = load_controller(controller_name) if mode == "ml" else None
+        self.controller = load_controller(controller_name)       if mode == "ml" else None
 
-        # Buffer de features en ligne (fenêtre glissante 60 ticks par machine)
         self._feat_buffer = OnlineFeatureBuffer()
-
-        # État interne : RPM précédent par machine
         self._prev_rpm: dict[str, int] = {}
 
-        logger.info(f"Supervisor prêt — mode={mode}  dry_run={dry_run}")
+        # Consumer MQTT (Option E)
+        from supervisor.mqtt_telemetry import MqttTelemetryConsumer
+        self._mqtt = MqttTelemetryConsumer(
+            buffer=self._feat_buffer,
+            broker_host=mqtt_host,
+            broker_port=mqtt_port,
+            decision_interval_ticks=decision_interval_ticks,
+        )
 
+        # Déduplication des warnings répétitifs
+        self._warn_counts: dict[str, int] = {}
+
+        logger.info("Supervisor prêt — mode=%s  dry_run=%s", mode, dry_run)
+
+    # ------------------------------------------------------------------
+    # Prédiction et décision
     # ------------------------------------------------------------------
 
     def _predict_risk(self, state_series: "pd.Series") -> float:
-        """Retourne un risk_score ∈ [0, 1]."""
         if self.predictor is None:
             return 0.0
         import pandas as pd
         X = pd.DataFrame([state_series])
-        # Garder seulement les colonnes connues du modèle
         try:
             proba = self.predictor.predict_proba(X)
             return float(proba[0, 1])
         except Exception as e:
-            logger.debug(f"predict_proba échoué : {e}")
+            logger.debug("predict_proba échoué : %s", e)
             return 0.0
 
     def _decide_rpm(self, state_series: "pd.Series", risk_score: float) -> int:
-        """Retourne le RPM décidé pour une machine."""
-        # Surcharge risque élevé
         if risk_score >= self.risk_threshold:
             return RPM_HIGH
-
         if self.mode == "native":
-            return -1  # Ne pas intervenir
-
+            return -1
         if self.controller is None:
             return RPM_DEFAULT
-
         import pandas as pd
         X = pd.DataFrame([state_series])
         risk_arr = np.array([risk_score])
@@ -411,126 +353,247 @@ class Supervisor:
                 rpms = self.controller.decide_batch(X)
                 return max(int(rpms[0]), RPM_MIN)
             except Exception as e:
-                logger.debug(f"decide_batch échoué : {e}")
+                logger.debug("decide_batch échoué : %s", e)
                 return RPM_DEFAULT
 
-    def _process_machine(self, machine_id: str, snapshot: dict) -> dict:
-        """Traite une machine : prédit, décide, envoie, logue."""
-        # Alimenter le buffer et récupérer les features enrichies (fenêtres glissantes)
-        self._feat_buffer.update(machine_id, snapshot)
-        state = self._feat_buffer.get_features(machine_id)
-        risk  = self._predict_risk(state)
-        rpm   = self._decide_rpm(state, risk)
+    # ------------------------------------------------------------------
+    # Traitement d'une machine
+    # ------------------------------------------------------------------
 
+    def _process_machine(self, machine_id: str, snapshot: dict | None = None) -> dict:
+        """Prédit, décide, envoie, logue pour une machine.
+
+        Si snapshot est fourni (fallback REST), il alimente d'abord le buffer.
+        En mode MQTT, le buffer est déjà alimenté par le consumer.
+        """
+        if snapshot is not None:
+            self._feat_buffer.update(machine_id, snapshot)
+
+        state    = self._feat_buffer.get_features(machine_id)
+        risk     = self._predict_risk(state)
+        rpm      = self._decide_rpm(state, risk)
         prev_rpm = self._prev_rpm.get(machine_id, RPM_DEFAULT)
 
+        temp_c = float(state.get("temperature_c", 0.0))
+
         entry = {
-            "ts":             datetime.now(timezone.utc).isoformat(),
-            "machine_id":     machine_id,
-            "temperature_c":  float(snapshot.get("temperature_c", 0.0)),
-            "status":         str(snapshot.get("status", "unknown")),
-            "fan_rpm_mean":   float(state.get("fan_rpm_mean", 0.0)),
-            "risk_score":     round(risk, 4),
-            "rpm_decided":    rpm,
-            "rpm_previous":   prev_rpm,
-            "mode":           self.mode,
-            "risk_override":  risk >= self.risk_threshold,
+            "ts":            datetime.now(timezone.utc).isoformat(),
+            "machine_id":    machine_id,
+            "temperature_c": temp_c,
+            "status":        str(state.get("status", "unknown") if snapshot is None
+                                else snapshot.get("status", "unknown")),
+            "fan_rpm_mean":  float(state.get("fan_rpm_mean", 0.0)),
+            "risk_score":    round(risk, 4),
+            "rpm_decided":   rpm,
+            "rpm_previous":  prev_rpm,
+            "mode":          self.mode,
+            "risk_override": risk >= self.risk_threshold,
         }
 
+        # Envoyer la commande seulement si RPM change
         if rpm >= 0 and rpm != prev_rpm:
             if not self.dry_run:
-                fan_indices = self._fan_indices(snapshot)
-                ok = self.client.set_fan_speed(machine_id, rpm, fan_indices=fan_indices)
+                indices = _fan_indices(snapshot) if snapshot else [0, 1]
+                ok = self.client.set_fan_speed(machine_id, rpm, fan_indices=indices)
                 entry["command_sent"] = ok
             else:
-                entry["command_sent"] = None  # dry_run
+                entry["command_sent"] = None
             self._prev_rpm[machine_id] = rpm
+
+            # Log INFO : changement RPM ou risque élevé
+            risk_tag = " [RISK OVERRIDE]" if entry["risk_override"] else ""
+            dry_tag  = " [DRY RUN]" if self.dry_run else ""
             logger.info(
-                f"  {machine_id:<20} T={state['temperature_c']:.1f}°C  "
-                f"risk={risk:.2f}  RPM {prev_rpm}→{rpm}"
-                + (" [RISK OVERRIDE]" if entry["risk_override"] else "")
-                + (" [DRY RUN]" if self.dry_run else "")
+                "  %-20s  T=%5.1f°C  risk=%.2f  RPM %d→%d%s%s",
+                machine_id, temp_c, risk, prev_rpm, rpm, risk_tag, dry_tag,
+            )
+        elif risk > RISK_LOG_THRESHOLD:
+            # Log INFO : risque notable même sans changement RPM
+            logger.info(
+                "  %-20s  T=%5.1f°C  risk=%.2f  RPM %d (stable)",
+                machine_id, temp_c, risk, rpm if rpm >= 0 else prev_rpm,
             )
         else:
-            entry["command_sent"] = None  # Pas de changement
+            logger.debug(
+                "  %-20s  T=%5.1f°C  risk=%.2f  RPM %d",
+                machine_id, temp_c, risk, rpm if rpm >= 0 else prev_rpm,
+            )
 
+        entry["command_sent"] = entry.get("command_sent")
         self.dec_logger.log(entry)
         return entry
 
-    def step(self) -> list[dict]:
-        """Un cycle de décision : lit le cluster, traite toutes les machines."""
+    # ------------------------------------------------------------------
+    # Cycle de décision (commun MQTT et REST)
+    # ------------------------------------------------------------------
+
+    def _decision_cycle_mqtt(self) -> list[dict]:
+        """Décision sur les machines connues du buffer (mode MQTT)."""
+        results = []
+        for machine_id in self._feat_buffer.machines():
+            try:
+                result = self._process_machine(machine_id)
+                results.append(result)
+            except Exception as e:
+                logger.error("Erreur traitement %s : %s", machine_id, e)
+
+        # Résumé cluster en INFO
+        if results:
+            t_max    = max(r["temperature_c"] for r in results)
+            risk_max = max(r["risk_score"] for r in results)
+            n_on     = len(results)
+            elapsed  = getattr(self, "_t_elapsed", 0)
+            speed    = getattr(self, "_speed_multiplier", 1.0)
+            logger.info(
+                "[t=%ds speed=%.0fx]  cluster — %d on  T_max=%.1f°C  risk_max=%.2f",
+                elapsed, speed, n_on, t_max, risk_max,
+            )
+        return results
+
+    def _decision_cycle_rest(self) -> list[dict]:
+        """Cycle de décision en fallback REST (alimenter buffer + décider)."""
         cluster = self.client.get_cluster_status()
         if not cluster:
-            logger.warning("cluster/status vide — skip cycle")
+            self._log_warning_dedup("cluster_empty", "cluster/status vide — skip cycle")
             return []
 
-        machines_raw = cluster.get("machines", {})
-        if not machines_raw:
-            logger.warning("Aucune machine dans le cluster — skip cycle")
+        machines = _machines_from_cluster(cluster)
+        if not machines:
             return []
-
-        # Normaliser : l'API peut retourner un dict {id: snap} ou une liste [{machine_id, ...}]
-        if isinstance(machines_raw, list):
-            machines_data = {m.get("machine_id", m.get("id", f"machine_{i}")): m
-                             for i, m in enumerate(machines_raw)}
-        else:
-            machines_data = machines_raw
 
         results = []
-        for machine_id, snapshot in machines_data.items():
+        for machine_id, snapshot in machines.items():
             if snapshot.get("status") == "off":
                 continue
             try:
-                result = self._process_machine(machine_id, snapshot)
+                result = self._process_machine(machine_id, snapshot=snapshot)
                 results.append(result)
             except Exception as e:
-                logger.error(f"Erreur traitement {machine_id} : {e}")
+                logger.error("Erreur traitement %s : %s", machine_id, e)
+
+        if results:
+            t_max    = max(r["temperature_c"] for r in results)
+            risk_max = max(r["risk_score"] for r in results)
+            n_on     = len(results)
+            elapsed  = getattr(self, "_t_elapsed", 0)
+            speed    = getattr(self, "_speed_multiplier", 1.0)
+            logger.info(
+                "[t=%ds speed=%.0fx]  cluster — %d on  T_max=%.1f°C  risk_max=%.2f  [REST]",
+                elapsed, speed, n_on, t_max, risk_max,
+            )
         return results
 
-    def run(self, duration_s: float | None = None) -> None:
-        """Lance la boucle principale.
+    # ------------------------------------------------------------------
+    # Boucle principale asynchrone
+    # ------------------------------------------------------------------
 
-        Parameters
-        ----------
-        duration_s : durée max en secondes (None = infini jusqu'à Ctrl+C)
-        """
-        logger.info(f"=== Supervisor démarré — mode={self.mode} ===")
+    async def _run_async(self, duration_s: float | None = None) -> None:
+        """Boucle principale async : consumer MQTT + loop de décision."""
+        logger.info("=== Supervisor démarré — mode=%s ===", self.mode)
         if self.dry_run:
             logger.info("  [DRY RUN] Aucune commande ne sera envoyée")
 
-        # Mettre les machines en mode manual avant de prendre la main
+        # Lire speed_multiplier depuis l'API
+        try:
+            self._speed_multiplier = self.client.get_speed_multiplier()
+            logger.info("  speed_multiplier=%.0fx (simulateur)", self._speed_multiplier)
+        except Exception:
+            self._speed_multiplier = 1.0
+
+        # Passage en mode manual
         if self.mode != "native" and not self.dry_run:
             self._set_all_manual()
 
-        t_start = time.monotonic()
-        cycle   = 0
+        # Démarrer le consumer MQTT en arrière-plan
+        mqtt_task = asyncio.create_task(self._mqtt.run())
+        mqtt_ready = await self._mqtt.wait_ready(timeout=10.0)
+
+        if mqtt_ready:
+            logger.info("  Mode MQTT — buffer alimenté à la cadence simulée")
+            await self._loop_mqtt(duration_s)
+        else:
+            logger.info("  Mode REST fallback — lecture API toutes les %.0fs", self.decision_interval_s)
+            await self._loop_rest(duration_s)
+
+        # Arrêt propre
+        self._mqtt.stop()
+        mqtt_task.cancel()
+        try:
+            await mqtt_task
+        except asyncio.CancelledError:
+            pass
+
+        if self.mode != "native" and not self.dry_run:
+            self._set_all_auto()
+        self.client.close()
+        self.dec_logger.close()
+        logger.info("=== Supervisor arrêté ===")
+
+    async def _loop_mqtt(self, duration_s: float | None) -> None:
+        """Boucle de décision pilotée par les ticks MQTT."""
+        t_start  = time.monotonic()
+        self._t_elapsed = 0
+
+        # Attendre le premier message pour initialiser les machines
+        logger.info("  En attente des premiers ticks MQTT…")
+        await asyncio.sleep(2.0)
+
         try:
             while True:
-                cycle += 1
                 elapsed = time.monotonic() - t_start
+                self._t_elapsed = int(elapsed * self._speed_multiplier)
                 if duration_s is not None and elapsed >= duration_s:
                     break
-                logger.info(f"[cycle {cycle}] t={elapsed:.0f}s")
-                self.step()
-                time.sleep(self.decision_interval_s)
-        except KeyboardInterrupt:
-            logger.info("Arrêt demandé (Ctrl+C)")
-        finally:
-            if self.mode != "native" and not self.dry_run:
-                self._set_all_auto()
-            self.client.close()
-            self.dec_logger.close()
-            logger.info(f"=== Supervisor arrêté après {cycle} cycles ===")
 
-    def _fan_indices(self, snapshot: dict) -> list[int]:
-        """Retourne la liste des indices de fans d'une machine depuis son snapshot."""
-        fans = snapshot.get("fans", [])
-        if isinstance(fans, list):
-            return [f["idx"] for f in fans if "idx" in f]
-        return list(range(len(fans))) if fans else [0, 1]
+                results = []
+                for machine_id in list(self._feat_buffer.machines()):
+                    if self._mqtt.should_decide(machine_id):
+                        try:
+                            result = self._process_machine(machine_id)
+                            results.append(result)
+                        except Exception as e:
+                            logger.error("Erreur traitement %s : %s", machine_id, e)
+
+                if results:
+                    t_max    = max(r["temperature_c"] for r in results)
+                    risk_max = max(r["risk_score"] for r in results)
+                    logger.info(
+                        "[t=%ds speed=%.0fx]  cluster — %d machines  T_max=%.1f°C  risk_max=%.2f",
+                        self._t_elapsed, self._speed_multiplier, len(results), t_max, risk_max,
+                    )
+
+                await asyncio.sleep(1.0 / max(1.0, self._speed_multiplier))
+
+        except asyncio.CancelledError:
+            pass
+
+    async def _loop_rest(self, duration_s: float | None) -> None:
+        """Boucle de decision en fallback REST."""
+        t_start = time.monotonic()
+        self._t_elapsed = 0
+        try:
+            while True:
+                elapsed = time.monotonic() - t_start
+                self._t_elapsed = int(elapsed)
+                if duration_s is not None and elapsed >= duration_s:
+                    break
+                self._decision_cycle_rest()
+                await asyncio.sleep(self.decision_interval_s)
+        except asyncio.CancelledError:
+            pass
+
+    def run(self, duration_s: float | None = None) -> None:
+        """Point d'entree synchrone — lance la boucle async."""
+        try:
+            asyncio.run(self._run_async(duration_s))
+        except KeyboardInterrupt:
+            logger.info("Arret demande (Ctrl+C)")
+
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
 
     def _machines_iter(self, cluster: dict):
-        """Itère sur (machine_id, snapshot) quel que soit le format de l'API."""
         machines_raw = cluster.get("machines", {})
         if isinstance(machines_raw, list):
             for i, m in enumerate(machines_raw):
@@ -539,61 +602,68 @@ class Supervisor:
             yield from machines_raw.items()
 
     def _set_all_manual(self) -> None:
-        """Passe toutes les machines en mode manual fan."""
         cluster = self.client.get_cluster_status()
         for machine_id, snapshot in self._machines_iter(cluster):
-            indices = self._fan_indices(snapshot)
+            indices = _fan_indices(snapshot)
             self.client.set_fan_mode(machine_id, "manual", fan_indices=indices)
-            logger.info(f"  {machine_id} → mode manual (fans {indices})")
+            logger.info("  %s -> mode manual (fans %s)", machine_id, indices)
 
     def _set_all_auto(self) -> None:
-        """Repasse toutes les machines en mode auto fan."""
         cluster = self.client.get_cluster_status()
         for machine_id, snapshot in self._machines_iter(cluster):
-            indices = self._fan_indices(snapshot)
+            indices = _fan_indices(snapshot)
             self.client.set_fan_mode(machine_id, "auto", fan_indices=indices)
-            logger.info(f"  {machine_id} → mode auto (fans {indices})")
+            logger.info("  %s -> mode auto (fans %s)", machine_id, indices)
+
+    def _log_warning_dedup(self, key: str, msg: str) -> None:
+        """Log un warning en dedupliquant les repetitions."""
+        count = self._warn_counts.get(key, 0) + 1
+        self._warn_counts[key] = count
+        if count == 1 or count % 12 == 0:
+            suffix = " (x%d)" % count if count > 1 else ""
+            logger.warning("%s%s", msg, suffix)
 
 
 # ---------------------------------------------------------------------------
-# Point d'entrée CLI
+# Point d'entree CLI
 # ---------------------------------------------------------------------------
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Superviseur ML — Juste des Ventilateurs")
     parser.add_argument("--mode",        default=os.getenv("SUPERVISOR_MODE", "ml"),
-                        choices=["ml", "threshold", "native"],
-                        help="Mode de supervision (défaut: ml)")
-    parser.add_argument("--predictor",   default=os.getenv("PREDICTOR_MODEL", "logistic"),
-                        help="Modèle prédictif (défaut: logistic)")
-    parser.add_argument("--controller",  default=os.getenv("CONTROLLER_MODEL", "supervised"),
-                        help="Contrôleur (défaut: supervised)")
-    parser.add_argument("--label",       default="failure_60s",
-                        help="Label de panne (défaut: failure_60s)")
+                        choices=["ml", "threshold", "native"])
+    parser.add_argument("--predictor",   default=os.getenv("PREDICTOR_MODEL", "logistic"))
+    parser.add_argument("--controller",  default=os.getenv("CONTROLLER_MODEL", "supervised"))
+    parser.add_argument("--label",       default="failure_60s")
     parser.add_argument("--api-url",     default=os.getenv("API_BASE_URL", "http://localhost:8000"))
-    parser.add_argument("--interval",    type=float, default=float(os.getenv("DECISION_INTERVAL_S", "5")),
-                        help="Intervalle de décision en secondes (défaut: 5)")
-    parser.add_argument("--duration",    type=float, default=None,
-                        help="Durée max en secondes (None = infini)")
-    parser.add_argument("--risk-threshold", type=float, default=RISK_THRESHOLD,
-                        help=f"Seuil risk_score pour surcharge RPM_HIGH (défaut: {RISK_THRESHOLD})")
-    parser.add_argument("--run-name",    default="supervisor",
-                        help="Préfixe du fichier log")
-    parser.add_argument("--dry-run",     action="store_true",
-                        help="Simuler sans envoyer de commandes REST")
+    parser.add_argument("--mqtt-host",   default=os.getenv("MQTT_BROKER_HOST", "localhost"))
+    parser.add_argument("--mqtt-port",   type=int, default=int(os.getenv("MQTT_BROKER_PORT", "1883")))
+    parser.add_argument("--interval-ticks", type=int,
+                        default=int(os.getenv("DECISION_INTERVAL_TICKS", "5")),
+                        help="Decision toutes les N ticks simules MQTT (defaut: 5)")
+    parser.add_argument("--interval",    type=float,
+                        default=float(os.getenv("DECISION_INTERVAL_S", "5")),
+                        help="Intervalle REST fallback en secondes (defaut: 5)")
+    parser.add_argument("--duration",    type=float, default=None)
+    parser.add_argument("--risk-threshold", type=float, default=RISK_THRESHOLD)
+    parser.add_argument("--run-name",    default="supervisor")
+    parser.add_argument("--dry-run",     action="store_true")
     args = parser.parse_args()
 
     sup = Supervisor(
-        mode                = args.mode,
-        predictor_name      = args.predictor,
-        controller_name     = args.controller,
-        label               = args.label,
-        risk_threshold      = args.risk_threshold,
-        api_url             = args.api_url,
-        decision_interval_s = args.interval,
-        log_dir             = _DEFAULT_LOG_DIR,
-        run_name            = args.run_name,
-        dry_run             = args.dry_run,
+        mode                    = args.mode,
+        predictor_name          = args.predictor,
+        controller_name         = args.controller,
+        label                   = args.label,
+        risk_threshold          = args.risk_threshold,
+        api_url                 = args.api_url,
+        mqtt_host               = args.mqtt_host,
+        mqtt_port               = args.mqtt_port,
+        decision_interval_ticks = args.interval_ticks,
+        decision_interval_s     = args.interval,
+        log_dir                 = _DEFAULT_LOG_DIR,
+        run_name                = args.run_name,
+        dry_run                 = args.dry_run,
     )
     sup.run(duration_s=args.duration)
 
