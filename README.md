@@ -21,16 +21,35 @@ Ce projet implémente un service intelligent de supervision thermique qui s'appu
 ## Architecture
 
 ```
-jumeaux-chauds (simulateur)          juste-des-ventilateurs (ce projet)
-┌─────────────────────────┐         ┌──────────────────────────────────┐
-│  MQTT :1883             │◄────────│  ingest/ : subscriber MQTT       │
-│  REST API :8000         │◄────────│  supervisor/ : commandes REST    │
-│  (fans, machines)       │         │                                  │
-└─────────────────────────┘         │  features/ : feature engineering │
-                                    │  models/failure_prediction/      │
-                                    │  models/fan_control/             │
-                                    │  evaluation/ : benchmark         │
-                                    └──────────────────────────────────┘
+jumeaux-chauds (simulateur)
+┌─────────────────────────────────────────┐
+│  MQTT :1883                             │
+│    dt/{cluster}/{machine}/telemetry  ───┼──► supervisor/mqtt_telemetry.py
+│    dt/{cluster}/{machine}/status/fault ─┼──► ingest/mqtt_subscriber.py
+│  REST API :8000                         │
+│    GET /cluster/status               ◄──┼─── supervisor (fallback + résumé cycle)
+│    PUT /machines/{id}/fan_speed       ◄──┼─── supervisor (commandes)
+│    PUT /machines/{id}/fan_mode        ◄──┼─── supervisor (init manual/auto)
+└─────────────────────────────────────────┘
+
+juste-des-ventilateurs
+┌──────────────────────────────────────────────────────────────┐
+│  supervisor/mqtt_telemetry.py  ← abonné MQTT télémétrie      │
+│    (1 msg/s simulé, correct à toute vitesse de simulation)   │
+│         │                                                    │
+│         ▼                                                    │
+│  supervisor/online_features.py ← OnlineFeatureBuffer         │
+│    (fenêtres glissantes 5/15/30/60s alignées entraînement)   │
+│         │  (décision tous les decision_interval_ticks ticks) │
+│         ▼                                                    │
+│  supervisor/supervisor.py      ← boucle de décision          │
+│    predict risk → decide RPM → PUT fan_speed                 │
+│         │                                                    │
+│  ingest/         → collecte dataset (MQTT subscriber)        │
+│  features/       → feature engineering hors-ligne            │
+│  models/         → prédicteur de pannes + contrôleur fans    │
+│  evaluation/     → benchmark offline comparatif              │
+└──────────────────────────────────────────────────────────────┘
 ```
 
 ---
@@ -67,8 +86,10 @@ juste-des-ventilateurs/
 │       └── saved/
 │
 ├── supervisor/                 # Service de supervision temps réel
-│   ├── supervisor.py           # Boucle de décision principale
-│   └── decision_logger.py      # Logger des décisions et résultats
+│   ├── supervisor.py           # Boucle de décision (predict → decide → command)
+│   ├── online_features.py      # OnlineFeatureBuffer — fenêtres glissantes par machine ✅
+│   ├── mqtt_telemetry.py       # Consumer MQTT télémétrie (Phase 7) 🔲
+│   └── decision_logger.py      # Logger JSONL des décisions
 │
 ├── evaluation/                 # Protocole et métriques comparatives
 │   ├── benchmark.py            # Comparaison des couples prédicteur/contrôleur
@@ -191,14 +212,23 @@ python ingest_quick_EDA.py --processed-only
 ### Lancer le superviseur
 
 ```bash
-python -m supervisor.supervisor --predictor gradient_boosting --controller score_controller
+# Mode ML (prédicteur logistique + contrôleur supervisé, recommandé)
+python -m supervisor.supervisor --mode ml
+
+# Avec durée limitée et dry-run (test sans commandes)
+python -m supervisor.supervisor --mode ml --duration 300 --dry-run
+
+# Via Docker (jumeaux-chauds doit tourner sur le même hôte)
+docker compose up --build supervisor
 ```
 
-### Via Docker
-
-```bash
-docker compose up -d
-# Le superviseur se connecte automatiquement à jumeaux-chauds
+**Variables d'environnement clés (`.env`) :**
+```
+API_BASE_URL=http://localhost:8000
+MQTT_BROKER_HOST=localhost
+MQTT_BROKER_PORT=1883
+DECISION_INTERVAL_TICKS=5     # décision toutes les 5 secondes simulées
+RISK_LOG_THRESHOLD=0.05       # log machine seulement si risk > seuil
 ```
 
 ---

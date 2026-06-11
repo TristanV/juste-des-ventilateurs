@@ -393,35 +393,113 @@ J(t) = α·risk(t) + β·heat(t) + γ·energy(t) + δ·|ΔRPM_t|
 
 ## 7. Module Supervisor (`supervisor/`)
 
-### 7.1 Boucle de supervision (`supervisor/supervisor.py`)
+### 7.1 Architecture Phase 7 (cible)
 
-**Cycle de décision (fréquence : toutes les 5s par défaut) :**
+Le superviseur est structuré en deux boucles indépendantes :
 
 ```
-1. Lire l'état de chaque machine (via MQTT ou GET /machines/{id})
-2. Calculer les features (pipeline features/)
-3. Évaluer le risque (modèle prédictif → risk_score ∈ [0,1])
-4. Décider la consigne RPM (contrôleur → rpm_target)
-5. Si machine en mode auto : passer en mode manual (PUT /machines/{id}/fan_mode)
-6. Envoyer la consigne (PUT /machines/{id}/fan_speed)
-7. Logger la décision et les métriques observées
-8. Attendre le prochain cycle
+MQTT broker :1883
+  dt/{cluster}/+/telemetry
+       │
+       ▼  (1 msg/s simulé, quelle que soit la vitesse de simulation)
+supervisor/mqtt_telemetry.py  ← MqttTelemetryConsumer
+  - normalise le payload (même schéma que ingest/normalizer.py)
+  - appelle OnlineFeatureBuffer.update(machine_id, snapshot)
+  - fallback silencieux si MQTT indisponible
+       │
+       ▼  OnlineFeatureBuffer (fenêtre glissante 70 ticks par machine)
+       │  recalcule : temp_delta_5/15/30s, temp_rolling_mean/std_30/60s,
+       │              margin_*, rpm_*, power_*, pue_*, time_in_hot_zone_s,
+       │              nb_shutdowns_episode, ticks_since_last_fault, ...
+       │
+       ▼  (tous les decision_interval_ticks ticks simulés reçus, défaut=5)
+supervisor/supervisor.py  ← Supervisor._decision_loop()
+  - feat_buffer.get_features(machine_id) → pd.Series
+  - predictor.predict_proba(X) → risk_score
+  - controller.decide_batch(X) → rpm
+  - max(rpm, RPM_MIN=800)  ← plancher ventilation
+  - si risk >= RISK_THRESHOLD → override RPM_HIGH=4500
+  - PUT /machines/{id}/fan_speed (si rpm != prev_rpm)
+  - decision_logger.log(entry)
+  - fallback REST GET /cluster/status si MQTT indisponible
 ```
+
+**Correctif de sous-échantillonnage (complément à Option E)**
+
+L'Option E (MQTT) résout l'alimentation du buffer à la bonne cadence simulée. Sans sous-échantillonnage complémentaire, le loop de décision tournerait à `events_per_sec × speed_multiplier` fois/seconde réelle (60 décisions/s à `speed=60x`). Le mécanisme `decision_interval_ticks` compte les ticks MQTT reçus et ne déclenche une décision que toutes les N ticks — équivalent à décider toutes les N secondes *simulées*, robuste à toute vitesse.
 
 **Garanties :**
 - L'arrêt thermique automatique de jumeaux-chauds reste ACTIF (non court-circuité)
 - Si le superviseur crash, les machines restent dans leur dernier mode (safe by default)
-- Timeout REST : 500ms max par commande
+- Si MQTT indisponible : fallback sur GET /cluster/status REST (comportement Phase 6)
+- `RPM_MIN=800` : les fans ne s'arrêtent jamais complètement en mode supervisé
+- Timeout REST : 5s max par commande (configurable)
 
-### 7.2 Logger de décisions (`supervisor/decision_logger.py`)
+### 7.2 Boucle de supervision (`supervisor/supervisor.py`)
 
-Chaque décision est loggée avec :
-- `timestamp`, `machine_id`, `temperature_c`, `status`
-- `risk_score`, `failure_predicted` (bool)
-- `rpm_before`, `rpm_decided`, `fan_mode`
-- `event` : `shutdown`, `degraded`, `recovery`, `normal`
+**Modes de supervision :**
 
-Stockage : Parquet ou TimescaleDB selon configuration.
+| Mode | Prédicteur | Contrôleur | Description |
+|------|-----------|------------|-------------|
+| `ml` | LogisticPredictor | SupervisedController + override | **Recommandé** |
+| `threshold` | — | ThresholdFanController | Règles simples sans ML |
+| `native` | — | — | Aucune intervention (observation seule) |
+
+**Paramètres CLI principaux :**
+```
+--mode ml|threshold|native   Mode de supervision (défaut: ml)
+--duration N                 Durée max en secondes (défaut: infini)
+--risk-threshold 0.60        Seuil risk_score → RPM_HIGH override
+--dry-run                    Simuler sans envoyer de commandes REST
+```
+
+### 7.3 Buffer de features en ligne (`supervisor/online_features.py`) ✅
+
+`OnlineFeatureBuffer` maintient un historique de 70 ticks par machine (fenêtre max = 60s simulées + marge). À chaque tick MQTT reçu, il recalcule :
+
+| Feature | Formule | Fenêtre |
+|---------|---------|---------|
+| `temp_delta_{5,15,30}s` | `temp[t] - temp[t-w]` | 5/15/30 ticks |
+| `temp_rolling_mean_{30,60}s` | moyenne glissante | 30/60 ticks |
+| `temp_rolling_std_30s` | écart-type glissant | 30 ticks |
+| `margin_to_shutdown` | `88 - temp_c` | instantané |
+| `margin_delta_30s` | `-temp_delta_30s` | 30 ticks |
+| `power_fans_w` | `P_nom × (RPM/RPM_max)³ × n_fans` | instantané |
+| `pue_estimated` | `1 + P_fans / P_compute` | instantané |
+| `time_in_hot_zone_s` | durée cumulée T > 70.4°C | cumulatif |
+| `nb_shutdowns_episode` | transitions → "off" | cumulatif |
+| `ticks_since_last_fault` | ticks depuis dernière panne | cumulatif |
+
+Ces features sont strictement alignées sur `features/temporal.py`, `features/energy.py` et `features/contextual.py` utilisés à l'entraînement.
+
+### 7.4 Consumer MQTT télémétrie (`supervisor/mqtt_telemetry.py`) 🔲
+
+*(Phase 7 — à développer)*
+
+`MqttTelemetryConsumer` s'abonne à `dt/{cluster}/+/telemetry` via `aiomqtt` et alimente le buffer à chaque message reçu. Tourne en coroutine asyncio dans le même process que le superviseur.
+
+### 7.5 Logger de décisions (`supervisor/decision_logger.py`)
+
+Chaque décision est loggée en JSONL avec :
+- `ts`, `machine_id`, `temperature_c`, `status`
+- `risk_score`, `risk_override` (bool)
+- `rpm_previous`, `rpm_decided`, `command_sent` (bool)
+- `mode`
+
+### 7.6 Logs superviseur — niveaux et format 🔲
+
+*(Phase 7 — à développer)*
+
+| Niveau | Contenu |
+|--------|---------|
+| `DEBUG` | Requêtes HTTP 200 OK (httpx), cycles sans événement |
+| `INFO` | Une ligne par cycle : `[t=120s speed=1x] cluster — 5 on  T_max=67.3°C  risk_max=0.12` |
+| `INFO` | Une ligne par machine si `risk > RISK_LOG_THRESHOLD` ou RPM change : `srv-worker-01  T=67.3°C  risk=0.42  RPM 1500→3500 [RISK OVERRIDE]` |
+| `INFO` | Connexions initiales, passage manual/auto |
+| `WARNING` | Erreurs réseau, timeout — dédupliquées : `GET /cluster/status échoué (×12 depuis 60s)` |
+| `ERROR` | Exceptions inattendues |
+
+`RISK_LOG_THRESHOLD` configurable via `.env` (défaut `0.05`).
 
 ---
 
@@ -456,19 +534,29 @@ Stockage : Parquet ou TimescaleDB selon configuration.
 ### 9.1 Variables d'environnement (`.env`)
 
 ```env
+# API jumeaux-chauds
+API_BASE_URL=http://localhost:8000
+# Sur Docker Desktop Windows, utiliser host.docker.internal à la place de localhost
+
+# MQTT (Phase 7)
 MQTT_BROKER_HOST=localhost
 MQTT_BROKER_PORT=1883
 MQTT_TOPIC_ROOT=dt
 CLUSTER_ID=cluster_alpha
-API_BASE_URL=http://localhost:8000
+
+# Superviseur
+SUPERVISOR_MODE=ml
+PREDICTOR_MODEL=logistic
+CONTROLLER_MODEL=supervised
+RISK_THRESHOLD=0.6
+DECISION_INTERVAL_S=5          # Phase 6 : intervalle REST en secondes
+DECISION_INTERVAL_TICKS=5      # Phase 7 : décision toutes les N ticks simulés MQTT
+RISK_LOG_THRESHOLD=0.05        # Seuil minimum pour logger une machine en INFO
+
+# Données
 T_SHUTDOWN_DEFAULT_C=88.0
 STORAGE_BACKEND=parquet
 PARQUET_DATA_DIR=./data
-DECISION_INTERVAL_S=5
-PREDICTOR_MODEL=gradient_boosting
-CONTROLLER_MODEL=score_controller
-RISK_THRESHOLD=0.6
-ROLLING_WINDOW_S=60
 ```
 
 ### 9.2 Structure Docker
@@ -478,13 +566,20 @@ ROLLING_WINDOW_S=60
 services:
   supervisor:
     build: .
-    depends_on: [mosquitto]
     env_file: .env
+    environment:
+      # Docker Desktop Windows : host.docker.internal → hôte Windows
+      - API_BASE_URL=http://host.docker.internal:8000
+      - MQTT_BROKER_HOST=host.docker.internal
     volumes:
       - ./data:/app/data
       - ./models:/app/models
-    network_mode: host  # pour rejoindre le réseau jumeaux-chauds
+      - ./supervisor/logs:/app/supervisor/logs
+    # Note : network_mode:host ignoré silencieusement sur Docker Desktop Windows
+    #        Utiliser host.docker.internal pour joindre les services de l'hôte
 ```
+
+**Note Docker Desktop Windows :** `network_mode: host` est silencieusement ignoré sur Docker Desktop Windows. Pour joindre jumeaux-chauds (API REST et MQTT) depuis un container, utiliser `host.docker.internal` comme hostname.
 
 ### 9.3 Requirements principaux
 

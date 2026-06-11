@@ -1,21 +1,22 @@
 # Roadmap — Juste des Ventilateurs
 
 Projet M2 Data/IA — LaPlateforme_  
-Version 1.2 — Juin 2026
+Version 1.3 — Juin 2026
 
 ---
 
 ## Vue d'ensemble
 
-Le projet est organisé en 6 phases successives, chacune livrant des artefacts exploitables. Les phases 1 à 3 sont des fondations ; les phases 4 à 6 constituent le cœur ML et l'évaluation comparative.
+Le projet est organisé en 7 phases successives, chacune livrant des artefacts exploitables. Les phases 1 à 3 sont des fondations ; les phases 4 à 6 constituent le cœur ML et l'évaluation comparative. La phase 7 renforce la robustesse du superviseur en conditions réelles.
 
 ```
-Phase 1 : Prise en main          [Semaine 1]
-Phase 2 : Ingestion & stockage   [Semaine 1-2]
-Phase 3 : Feature engineering    [Semaine 2-3]
-Phase 4 : Modèle prédictif       [Semaine 3-4]
-Phase 5 : Contrôleur prescriptif [Semaine 4-5]
-Phase 6 : Boucle fermée & éval   [Semaine 5-6]
+Phase 1 : Prise en main             [Semaine 1]
+Phase 2 : Ingestion & stockage      [Semaine 1-2]
+Phase 3 : Feature engineering       [Semaine 2-3]
+Phase 4 : Modèle prédictif          [Semaine 3-4]
+Phase 5 : Contrôleur prescriptif    [Semaine 4-5]
+Phase 6 : Boucle fermée & éval      [Semaine 5-6]
+Phase 7 : Superviseur robuste       [Semaine 6-7]
 ```
 
 ---
@@ -347,6 +348,116 @@ pytest tests/test_phase6_supervisor.py -v -m "not slow"
 
 ---
 
+## Phase 7 — Superviseur robuste et télémétrie temps réel
+
+**Objectif :** Corriger les limitations du superviseur Phase 6 découvertes en test live contre jumeaux-chauds, et le rendre robuste à toute vitesse de simulation.
+
+### Contexte et diagnostic
+
+Trois problèmes ont été identifiés lors des tests live :
+
+**Problème 1 — Features nulles (corrigé Phase 6 post-livraison)**
+Le superviseur calculait les features à partir d'un snapshot unique (pas de mémoire temporelle). Toutes les features glissantes (`temp_delta_*`, `temp_rolling_*`, etc.) étaient fixées à 0.0, rendant le prédicteur aveugle aux montées en température. Le modèle voyait toujours le profil d'une machine froide et stable.
+
+**Problème 2 — Fréquence de lecture inadaptée**
+Le superviseur lit l'API REST toutes les 5 secondes réelles. Jumeaux-chauds publie 1 snapshot par seconde simulée (`events_per_sec=1.0`). À `speed=1x`, le buffer accumule 1 point toutes les 5 secondes au lieu de 1 par seconde : les fenêtres glissantes sont 5× trop larges. À `speed=60x`, la divergence atteint 300×.
+
+**Problème 3 — Logs trop verbeux**
+Chaque GET `/cluster/status` générait une ligne de log httpx, soit ~12 lignes/minute masquant les informations utiles (décisions, risques, anomalies).
+
+### Tâche 1 — Correctifs déjà livrés (fin Phase 6) ✅
+
+- [x] `supervisor/online_features.py` : `OnlineFeatureBuffer` — fenêtre glissante 70 ticks par machine
+  - Recalcule `temp_delta_5/15/30s`, `temp_rolling_mean/std_30/60s`, `margin_*`, `rpm_*`, `power_*`
+  - Calcule `pue_estimated`, `power_fans_w` (loi cubique RPM³), `energy_fans_kwh_cumulated`
+  - Maintient les compteurs cumulatifs : `time_in_hot_zone_s`, `nb_shutdowns_episode`, `ticks_since_last_fault`, `is_recovering`
+  - Aligné exactement sur `features/temporal.py`, `features/energy.py`, `features/contextual.py`
+- [x] `supervisor/supervisor.py` : `RPM_MIN=800` — plancher de ventilation (évite RPM=0 à froid)
+- [x] `supervisor/supervisor.py` : `_machines_iter()` — normalisation liste/dict pour compat API
+- [x] `models/failure_prediction/logistic_regression.py` : `load()` rétrocompat joblib multi-clés
+- [x] `docker-compose.yml` : `host.docker.internal` (fix Docker Desktop Windows)
+- [x] `evaluation/_compat.py` : UTF-8 stdout Windows CMD
+
+### Tâche 2 — Nettoyage des logs superviseur 🔲
+
+**Objectif :** Rendre le flux de logs lisible en conditions réelles, avec le principe "silence = tout va bien".
+
+- [ ] Passer en `DEBUG` : tous les logs httpx (GET/PUT HTTP 200 OK), `[cycle N] t=Xs`
+- [ ] Configurer httpx pour ne logger qu'en WARNING par défaut : `logging.getLogger("httpx").setLevel(logging.WARNING)`
+- [ ] Garder en `INFO` reformaté :
+  - **Une ligne par cycle** (toutes les N secondes) : `[t=120s  speed=1x]  cluster — 5 on  T_max=67.3°C  risk_max=0.12`
+  - **Une ligne par machine** uniquement si `risk > RISK_LOG_THRESHOLD` (défaut 0.05) **ou** RPM change : `srv-worker-01  T=67.3°C  risk=0.42  RPM 1500→3500 [RISK OVERRIDE]`
+  - Connexions initiales et passage en mode manual/auto
+  - Warnings et erreurs
+- [ ] **Déduplication des erreurs répétitives** : si la même erreur se répète consécutivement, n'afficher qu'un message résumé toutes les N occurrences (ex: `GET /cluster/status échoué (×12 depuis 60s) — dernière erreur : [Errno 101]`)
+- [ ] Variable d'environnement `RISK_LOG_THRESHOLD` (défaut 0.05) configurable via `.env`
+
+**Livrables :**
+- `supervisor/supervisor.py` modifié (log reformaté, déduplication)
+
+### Tâche 3 — Option E : télémétrie via MQTT (subscriber dédié) 🔲
+
+**Pourquoi Option E et non C**
+
+L'Option C (corriger `tick_hz` du buffer selon `speed_multiplier`) reste une approximation : à `speed=60x` avec lecture REST toutes les 5s réelles, chaque tick du buffer représente 300 secondes simulées — impossible de reconstituer `temp_delta_5s` (qui nécessite 5 ticks consécutifs à 1 Hz simulé). L'Option C ne résout le problème qu'à `speed=1x`.
+
+L'Option E reçoit les snapshots **au rythme de la simulation** via MQTT (`events_per_sec=1.0` en temps simulé). Le buffer se remplit à la bonne cadence quelle que soit la vitesse : à `speed=60x`, il reçoit 60 snapshots par seconde réelle et accumule 60 secondes simulées en 1 seconde réelle. Les features glissantes sont toujours calculées sur les bonnes fenêtres temporelles simulées.
+
+**Correctif Option C nécessaire en complément**
+
+L'Option E résout l'alimentation du buffer. Mais la *décision* (envoyer une commande fan) doit rester cadencée en temps simulé, pas en temps réel. Sans correction, le superviseur déciderait 60×/seconde à `speed=60x`, surchargeant l'API. Il faut donc ajouter un mécanisme de **sous-échantillonnage des décisions** : le buffer reçoit tous les ticks MQTT, mais une décision n'est prise que tous les `decision_interval_ticks` ticks simulés (ex: toutes les 5 secondes simulées = 5 ticks). Ce compteur est l'unique emprunt à l'esprit de l'Option C.
+
+**Architecture cible**
+
+```
+jumeaux-chauds MQTT :1883
+  topic: dt/cluster_alpha/+/telemetry  (1 msg/s simulé par machine)
+       │
+       ▼
+supervisor/mqtt_telemetry.py          ← NOUVEAU
+  MqttTelemetryConsumer
+  - s'abonne à dt/{cluster}/+/telemetry
+  - normalise le payload (même logique que ingest/normalizer.py)
+  - appelle feat_buffer.update(machine_id, snapshot) à chaque message
+  - thread/tâche asyncio séparée du loop de décision
+       │
+       ▼
+supervisor/online_features.py
+  OnlineFeatureBuffer (déjà livré)
+  - accumule les ticks à la cadence MQTT (= cadence simulée)
+       │
+       ▼ (tous les decision_interval_ticks ticks simulés)
+supervisor/supervisor.py
+  Supervisor._decision_loop()
+  - lit feat_buffer.get_features() pour chaque machine
+  - prédit risk, décide RPM, envoie commande REST
+  - logue la décision
+```
+
+**Points de conception :**
+- Le consumer MQTT tourne en `asyncio` dans le même process (pas de thread séparé)
+- La commande fan continue à passer par REST (`PUT /machines/{id}/fan_speed`) — MQTT est uniquement lecture
+- Si MQTT est indisponible (pas de broker), fallback sur lecture REST (comportement Phase 6)
+- `decision_interval_ticks` configurable (défaut 5 = toutes les 5s simulées)
+- Le `speed_multiplier` courant est lu depuis l'API au démarrage pour dimensionner les logs (`[t=120s speed=60x]`)
+
+**Tâches de développement :**
+- [ ] `supervisor/mqtt_telemetry.py` : `MqttTelemetryConsumer` — subscriber asyncio, normalisation payload, alimentation buffer
+- [ ] `supervisor/supervisor.py` : refactoring boucle principale — séparer tick MQTT (alimentation buffer) et cycle de décision (sous-échantillonnage)
+- [ ] `supervisor/supervisor.py` : fallback REST si MQTT indisponible
+- [ ] `.env.example` : ajouter `MQTT_BROKER_HOST`, `MQTT_BROKER_PORT`, `DECISION_INTERVAL_TICKS`
+- [ ] `docker-compose.yml` : ajouter variables MQTT au service supervisor
+- [ ] `tests/test_phase7_supervisor.py` : tests unitaires MqttTelemetryConsumer + boucle de décision sous-échantillonnée
+- [ ] Mettre à jour `documents/rapport_analyse.md` avec résultats live post-Phase 7
+
+**Livrables attendus :**
+- `supervisor/mqtt_telemetry.py`
+- `supervisor/supervisor.py` refactorisé
+- `tests/test_phase7_supervisor.py`
+- Mise à jour `docker-compose.yml`, `.env.example`
+
+---
+
 ## Récapitulatif des livrables
 
 | Livrable | Phase | Priorité |
@@ -357,8 +468,10 @@ pytest tests/test_phase6_supervisor.py -v -m "not slow"
 | `models/failure_prediction/` : 3 modèles + baseline | 4 | Essentielle |
 | `models/fan_control/` : 3+ contrôleurs | 5 | Essentielle |
 | `supervisor/` : boucle fermée temps réel | 6 | Essentielle |
+| `supervisor/online_features.py` : buffer features glissantes | 7 | Essentielle |
+| `supervisor/mqtt_telemetry.py` : consumer MQTT télémétrie | 7 | Essentielle |
 | `evaluation/` : protocole + résultats | 4-6 | Essentielle |
-| `documents/rapport_analyse.md` | 6 | Essentielle |
+| `documents/rapport_analyse.md` | 6-7 | Essentielle |
 | `docker-compose.yml` | 2 | Recommandée |
 | Bandit contextuel | 5 | Optionnelle |
 
