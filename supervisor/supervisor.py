@@ -35,6 +35,7 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
 from supervisor.decision_logger import DecisionLogger
+from supervisor.online_features import OnlineFeatureBuffer
 
 logging.basicConfig(
     level=logging.INFO,
@@ -49,6 +50,7 @@ logger = logging.getLogger("supervisor")
 RPM_LEVELS     = [0, 1500, 2500, 3500, 4500]
 RPM_HIGH       = 4500   # RPM d'urgence quand risk_score > threshold
 RPM_DEFAULT    = 2500   # RPM de sécurité si aucune décision possible
+RPM_MIN        = 800    # Plancher : ventilation minimale même à froid
 RISK_THRESHOLD = 0.60   # Seuil de surcharge risque → RPM_HIGH
 
 # Features attendues par le prédicteur (doit correspondre aux 47 features du splitter)
@@ -362,6 +364,9 @@ class Supervisor:
         self.predictor  = load_predictor(predictor_name, label) if mode == "ml" else None
         self.controller = load_controller(controller_name) if mode == "ml" else None
 
+        # Buffer de features en ligne (fenêtre glissante 60 ticks par machine)
+        self._feat_buffer = OnlineFeatureBuffer()
+
         # État interne : RPM précédent par machine
         self._prev_rpm: dict[str, int] = {}
 
@@ -400,18 +405,20 @@ class Supervisor:
         risk_arr = np.array([risk_score])
         try:
             rpms = self.controller.decide_batch(X, risk_scores=risk_arr)
-            return int(rpms[0])
+            return max(int(rpms[0]), RPM_MIN)
         except TypeError:
             try:
                 rpms = self.controller.decide_batch(X)
-                return int(rpms[0])
+                return max(int(rpms[0]), RPM_MIN)
             except Exception as e:
                 logger.debug(f"decide_batch échoué : {e}")
                 return RPM_DEFAULT
 
     def _process_machine(self, machine_id: str, snapshot: dict) -> dict:
         """Traite une machine : prédit, décide, envoie, logue."""
-        state = snapshot_to_series(snapshot)
+        # Alimenter le buffer et récupérer les features enrichies (fenêtres glissantes)
+        self._feat_buffer.update(machine_id, snapshot)
+        state = self._feat_buffer.get_features(machine_id)
         risk  = self._predict_risk(state)
         rpm   = self._decide_rpm(state, risk)
 
@@ -522,10 +529,19 @@ class Supervisor:
             return [f["idx"] for f in fans if "idx" in f]
         return list(range(len(fans))) if fans else [0, 1]
 
+    def _machines_iter(self, cluster: dict):
+        """Itère sur (machine_id, snapshot) quel que soit le format de l'API."""
+        machines_raw = cluster.get("machines", {})
+        if isinstance(machines_raw, list):
+            for i, m in enumerate(machines_raw):
+                yield m.get("machine_id", m.get("id", f"machine_{i}")), m
+        else:
+            yield from machines_raw.items()
+
     def _set_all_manual(self) -> None:
         """Passe toutes les machines en mode manual fan."""
         cluster = self.client.get_cluster_status()
-        for machine_id, snapshot in cluster.get("machines", {}).items():
+        for machine_id, snapshot in self._machines_iter(cluster):
             indices = self._fan_indices(snapshot)
             self.client.set_fan_mode(machine_id, "manual", fan_indices=indices)
             logger.info(f"  {machine_id} → mode manual (fans {indices})")
@@ -533,7 +549,7 @@ class Supervisor:
     def _set_all_auto(self) -> None:
         """Repasse toutes les machines en mode auto fan."""
         cluster = self.client.get_cluster_status()
-        for machine_id, snapshot in cluster.get("machines", {}).items():
+        for machine_id, snapshot in self._machines_iter(cluster):
             indices = self._fan_indices(snapshot)
             self.client.set_fan_mode(machine_id, "auto", fan_indices=indices)
             logger.info(f"  {machine_id} → mode auto (fans {indices})")
