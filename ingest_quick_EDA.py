@@ -281,6 +281,9 @@ def analyse_processed(ep_id: str, ep_dir: Path, meta: dict):
         print()
         print("  Top 10 features corrélées avec failure_60s :")
         for feat, val in top10.items():
+            if np.isnan(val):
+                print(f"    {feat:<35} |{'N/A':<20}| NaN (feature constante)")
+                continue
             bar = "█" * int(val * 20)
             print(f"    {feat:<35} |{bar:<20}| {val:.3f}")
 

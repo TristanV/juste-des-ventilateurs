@@ -6,7 +6,7 @@ set LABEL=%1
 if "%LABEL%"=="" set LABEL=failure_60s
 
 echo ============================================================
-echo Phase 5 -- Entrainement et evaluation des controleurs fans
+echo Phase 6 -- Boucle fermee et evaluation comparative
 echo Label : %LABEL%
 echo ============================================================
 echo.
@@ -14,43 +14,45 @@ echo.
 set FAILED=0
 
 REM ----------------------------------------------------------------
-REM 1. EDA rapide pour verifier les donnees
+REM 1. Benchmark comparatif (native vs threshold vs ml)
 REM ----------------------------------------------------------------
-echo [1/3] Verification des donnees (EDA)...
-python ingest_quick_EDA.py --processed-only
+echo [1/3] Benchmark comparatif (native / threshold / ml)...
+python -m evaluation.benchmark --label %LABEL%
 set _RC=%ERRORLEVEL%
-call :check_step "EDA" %_RC%
+call :check_step "benchmark" %_RC%
 
 echo.
 
 REM ----------------------------------------------------------------
-REM 2. Entrainement et evaluation comparative de tous les controleurs
+REM 2. Test de robustesse par scenario
 REM ----------------------------------------------------------------
-echo [2/3] Evaluation comparative de tous les controleurs...
-python -m evaluation.fan_control_eval --label %LABEL% --models all
+echo [2/3] Test de robustesse par scenario...
+python -m evaluation.robustness --label %LABEL%
 set _RC=%ERRORLEVEL%
-call :check_step "fan_control_eval" %_RC%
+call :check_step "robustness" %_RC%
 
 echo.
 
 REM ----------------------------------------------------------------
-REM 3. Verification des fichiers produits
+REM 3. Verification des artefacts produits
 REM ----------------------------------------------------------------
 echo [3/3] Verification des artefacts produits...
 
-set RESULTS_FILE=evaluation\results\fan_control_results.json
-if exist "%RESULTS_FILE%" (
-    echo   OK : %RESULTS_FILE%
+set BENCH_FILE=evaluation\results\benchmark_results_%LABEL%.json
+if exist "%BENCH_FILE%" (
+    echo   OK : %BENCH_FILE%
 ) else (
-    echo   MANQUANT : %RESULTS_FILE%
+    echo   MANQUANT : %BENCH_FILE%
     set FAILED=1
 )
 
-call :check_saved baseline_fixed_1500.json
-call :check_saved baseline_threshold.json
-call :check_saved baseline_pid.json
-call :check_saved supervised.joblib
-call :check_saved score_controller.json
+set ROB_FILE=evaluation\results\robustness_results_%LABEL%.json
+if exist "%ROB_FILE%" (
+    echo   OK : %ROB_FILE%
+) else (
+    echo   MANQUANT : %ROB_FILE%
+    set FAILED=1
+)
 
 echo.
 if %FAILED% gtr 0 goto :failure
@@ -63,27 +65,21 @@ echo ============================================================
 exit /b 1
 
 :success
-
 echo ============================================================
-echo Phase 5 terminee avec succes
-echo Resultats : evaluation\results\fan_control_results.json
+echo Phase 6 terminee avec succes
+echo Resultats :
+echo   evaluation\results\benchmark_results_%LABEL%.json
+echo   evaluation\results\robustness_results_%LABEL%.json
 echo ============================================================
+echo.
+echo Prochaine etape : visualiser avec notebooks\05_evaluation_comparative.ipynb
 exit /b 0
 
 :check_step
 set STEP_NAME=%~1
 set STEP_CODE=%~2
 if %STEP_CODE% neq 0 (
-    echo   ERREUR dans l'etape : %STEP_NAME% (code %STEP_CODE%)
+    echo   ERREUR dans l'etape : %STEP_NAME% ^(code %STEP_CODE%^)
     set /a FAILED+=1
-)
-goto :eof
-
-:check_saved
-set SAVED_FILE=models\fan_control\saved\%~1
-if exist "%SAVED_FILE%" (
-    echo   OK : %SAVED_FILE%
-) else (
-    echo   INFO : %SAVED_FILE% -- non genere si controleur saute
 )
 goto :eof

@@ -1,7 +1,7 @@
 # Roadmap — Juste des Ventilateurs
 
 Projet M2 Data/IA — LaPlateforme_  
-Version 1.3 — Juin 2026
+Version 1.4 — Juin 2026
 
 ---
 
@@ -16,7 +16,7 @@ Phase 3 : Feature engineering       [Semaine 2-3]
 Phase 4 : Modèle prédictif          [Semaine 3-4]
 Phase 5 : Contrôleur prescriptif    [Semaine 4-5]
 Phase 6 : Boucle fermée & éval      [Semaine 5-6]
-Phase 7 : Superviseur robuste       [Semaine 6-7]
+Phase 7 : Superviseur robuste       [Semaine 6-7] ✅
 ```
 
 ---
@@ -92,9 +92,9 @@ python -m ingest.mqtt_subscriber --continuous --episode 001 --scenario stress
 ### Tâches
 
 - [x] `features/temporal.py` : dérivées de température (5s/15s/30s), rolling means, marge au shutdown, RPM variance/CV
-- [x] `features/contextual.py` : durée en zone chaude, compteurs shutdowns/degraded, indicateurs de pannes, changements de consigne RPM, flag récupération
+- [x] `features/contextual.py` : durée en zone chaude, compteurs shutdowns/degraded, indicateurs de pannes, changements de consigne RPM, flag récupération, **status one-hot** (`is_on/is_degraded/is_off/time_in_off_s`)
 - [x] `features/energy.py` : puissance fans (loi cubique RPM³), fan_energy_ratio, pue_estimated, energy_fans_kwh_cumulated
-- [x] `features/labeler.py` : failure_60s / failure_30s / hot_30s (forward-looking), time_to_failure_s, optimal_rpm / action_class
+- [x] `features/labeler.py` : failure_60s / failure_30s / hot_30s (forward-looking), time_to_failure_s, optimal_rpm / action_class — **heuristique `off` corrigée** (v1.5 : only dangereux si T > 50% seuil OU shutdown récent < 60 ticks)
 - [x] `features/pipeline.py` : pipeline complet CLI, traitement multi-machine, export Parquet
 - [x] `tests/test_features.py` : 28 tests unitaires
 - [x] `notebooks/02_feature_engineering.ipynb` : distributions, corrélations, split temporel
@@ -197,17 +197,24 @@ Split sur 6 épisodes (304k lignes, 47 features) :
 
 ### Commandes
 ```bash
-# Entrainement + evaluation comparative (tous les modeles)
-train_models.bat
+# Option recommandee : entrainer et benchmarker les 3 labels d'un coup
+run_all_labels.bat
 
-# Label specifique
-train_models.bat failure_30s
+# Ou etape par etape :
+03_train_models.bat                  # failure_60s (defaut)
+03_train_models.bat failure_30s
+03_train_models.bat hot_30s
 
 # EDA rapide pour verifier les splits avant entrainement
 python ingest_quick_EDA.py --processed-only
 
 # Evaluation seule (sans re-entrainement)
 python -m evaluation.failure_prediction_eval --label failure_60s --models baseline logistic random_forest gradient_boosting
+
+# Resultats produits (un fichier par label) :
+#   evaluation/results/failure_prediction_results_failure_60s.json
+#   evaluation/results/failure_prediction_results_failure_30s.json
+#   evaluation/results/failure_prediction_results_hot_30s.json
 ```
 
 ---
@@ -263,14 +270,17 @@ Actions discrétisées : `RPM ∈ {0, 1500, 2500, 3500, 4500}` par ventilateur.
 
 ### Commandes
 ```bash
-# Entrainement + evaluation comparative (tous les controleurs)
-train_fan_controllers.bat
+# Entrainement + evaluation comparative (tous les controleurs, sur failure_60s)
+04_train_fan_controllers.bat
 
 # Evaluation seule
 python -m evaluation.fan_control_eval --label failure_60s
 
 # Controleurs specifiques
 python -m evaluation.fan_control_eval --models baseline_pid score_controller
+
+# Resultat produit :
+#   evaluation/results/fan_control_results_failure_60s.json
 
 # Tests
 pytest tests/test_phase5_controllers.py -v
@@ -318,29 +328,42 @@ pytest tests/test_phase5_controllers.py -v -m "not slow"
 ### Livrables ✅
 - `supervisor/supervisor.py` : service de supervision temps réel
 - `supervisor/decision_logger.py` : logger JSONL
-- `evaluation/benchmark.py` : benchmark comparatif 3 modes
-- `evaluation/robustness.py` : test robustesse par scénario
-- `evaluation/results/benchmark_results.json`
-- `evaluation/results/robustness_results.json`
+- `evaluation/benchmark.py` : benchmark comparatif 3 modes (sortie nommée avec le label)
+- `evaluation/robustness.py` : test robustesse par scénario (sortie nommée avec le label)
+- `evaluation/results/benchmark_results_{label}.json`
+- `evaluation/results/robustness_results_{label}.json`
 - `documents/rapport_analyse.md`
 - `notebooks/05_evaluation_comparative.ipynb`
-- `run_phase6.bat`
+- `run_all_labels.bat` : entraînement + benchmark des 3 labels en une commande
+- `05_benchmark_offline_metrics.bat`
 - `tests/test_phase6_supervisor.py`
 
 ### Commandes
 ```bash
-# Evaluation comparative offline (recommande)
-run_phase6.bat
+# Benchmark et robustesse pour les 3 labels (recommande apres run_all_labels.bat)
+05_benchmark_offline_metrics.bat              # failure_60s (defaut)
+05_benchmark_offline_metrics.bat failure_30s
+05_benchmark_offline_metrics.bat hot_30s
 
-# Benchmark seul
+# Ou tout d'un coup (train + benchmark 3 labels) :
+run_all_labels.bat
+
+# Benchmark seul (Python direct)
 python -m evaluation.benchmark --label failure_60s
-
-# Robustesse par scenario
 python -m evaluation.robustness --label failure_60s
+
+# Resultats produits :
+#   evaluation/results/benchmark_results_failure_60s.json
+#   evaluation/results/benchmark_results_failure_30s.json
+#   evaluation/results/benchmark_results_hot_30s.json
+#   evaluation/results/robustness_results_failure_60s.json  (idem pour les autres)
 
 # Supervisor temps reel (jumeaux-chauds doit tourner)
 python -m supervisor.supervisor --mode ml --duration 300 --dry-run
 python -m supervisor.supervisor --mode ml --duration 300
+
+# Visualisation comparative des 3 labels :
+#   notebooks/05_evaluation_comparative.ipynb  -> modifier la variable LABEL en tete
 
 # Tests
 pytest tests/test_phase6_supervisor.py -v -m "not slow"
@@ -348,7 +371,7 @@ pytest tests/test_phase6_supervisor.py -v -m "not slow"
 
 ---
 
-## Phase 7 — Superviseur robuste et télémétrie temps réel
+## Phase 7 — Superviseur robuste et télémétrie temps réel ✅
 
 **Objectif :** Corriger les limitations du superviseur Phase 6 découvertes en test live contre jumeaux-chauds, et le rendre robuste à toute vitesse de simulation.
 
@@ -378,22 +401,23 @@ Chaque GET `/cluster/status` générait une ligne de log httpx, soit ~12 lignes/
 - [x] `docker-compose.yml` : `host.docker.internal` (fix Docker Desktop Windows)
 - [x] `evaluation/_compat.py` : UTF-8 stdout Windows CMD
 
-### Tâche 2 — Nettoyage des logs superviseur 🔲
+### Tâche 2 — Nettoyage des logs superviseur ✅
 
 **Objectif :** Rendre le flux de logs lisible en conditions réelles, avec le principe "silence = tout va bien".
 
-- [ ] Passer en `DEBUG` : tous les logs httpx (GET/PUT HTTP 200 OK), `[cycle N] t=Xs`
-- [ ] Configurer httpx pour ne logger qu'en WARNING par défaut : `logging.getLogger("httpx").setLevel(logging.WARNING)`
-- [ ] Garder en `INFO` reformaté :
-  - **Une ligne par cycle** (toutes les N secondes) : `[t=120s  speed=1x]  cluster — 5 on  T_max=67.3°C  risk_max=0.12`
-  - **Une ligne par machine** uniquement si `risk > RISK_LOG_THRESHOLD` (défaut 0.05) **ou** RPM change : `srv-worker-01  T=67.3°C  risk=0.42  RPM 1500→3500 [RISK OVERRIDE]`
+- [x] Passer en `DEBUG` : tous les logs httpx (GET/PUT HTTP 200 OK), `[cycle N] t=Xs`
+- [x] Configurer httpx pour ne logger qu'en WARNING par défaut : `logging.getLogger("httpx").setLevel(logging.WARNING)`
+- [x] Garder en `INFO` reformaté :
+  - **Une ligne par cycle** (toutes les N secondes) : `[t=120s  speed=1x]  cluster -- 5 on  T_max=67.3 C  risk_max=0.12`
+  - **Une ligne par machine** uniquement si `risk > RISK_LOG_THRESHOLD` (défaut 0.05) **ou** RPM change
   - Connexions initiales et passage en mode manual/auto
   - Warnings et erreurs
-- [ ] **Déduplication des erreurs répétitives** : si la même erreur se répète consécutivement, n'afficher qu'un message résumé toutes les N occurrences (ex: `GET /cluster/status échoué (×12 depuis 60s) — dernière erreur : [Errno 101]`)
-- [ ] Variable d'environnement `RISK_LOG_THRESHOLD` (défaut 0.05) configurable via `.env`
+- [x] **Déduplication des erreurs répétitives** via `_log_warning_dedup()` — résumé toutes les N occurrences
+- [x] Variable d'environnement `RISK_LOG_THRESHOLD` (défaut 0.05) configurable via `.env`
+- [x] `--log-level` CLI argument + `LOG_LEVEL` env var (DEBUG/INFO/WARNING/ERROR)
 
 **Livrables :**
-- `supervisor/supervisor.py` modifié (log reformaté, déduplication)
+- `supervisor/supervisor.py` modifié (log reformaté, déduplication, --log-level)
 
 ### Tâche 3 — Option E : télémétrie via MQTT (subscriber dédié) 🔲
 
@@ -442,19 +466,42 @@ supervisor/supervisor.py
 - Le `speed_multiplier` courant est lu depuis l'API au démarrage pour dimensionner les logs (`[t=120s speed=60x]`)
 
 **Tâches de développement :**
-- [ ] `supervisor/mqtt_telemetry.py` : `MqttTelemetryConsumer` — subscriber asyncio, normalisation payload, alimentation buffer
-- [ ] `supervisor/supervisor.py` : refactoring boucle principale — séparer tick MQTT (alimentation buffer) et cycle de décision (sous-échantillonnage)
-- [ ] `supervisor/supervisor.py` : fallback REST si MQTT indisponible
-- [ ] `.env.example` : ajouter `MQTT_BROKER_HOST`, `MQTT_BROKER_PORT`, `DECISION_INTERVAL_TICKS`
-- [ ] `docker-compose.yml` : ajouter variables MQTT au service supervisor
-- [ ] `tests/test_phase7_supervisor.py` : tests unitaires MqttTelemetryConsumer + boucle de décision sous-échantillonnée
-- [ ] Mettre à jour `documents/rapport_analyse.md` avec résultats live post-Phase 7
+- [x] `supervisor/mqtt_telemetry.py` : `MqttTelemetryConsumer` — subscriber asyncio aiomqtt, normalisation payload, alimentation buffer, sous-echantillonnage `decision_interval_ticks`
+- [x] `supervisor/supervisor.py` : refactoring boucle principale -- `_loop_mqtt()` (chemin principal) + `_loop_rest()` (fallback), `_refresh_speed()` periodique
+- [x] `supervisor/supervisor.py` : fallback REST automatique si MQTT indisponible au demarrage
+- [x] `supervisor/supervisor.py` : correction `get_speed_multiplier()` vers `/simulation/speed`
+- [x] `supervisor/supervisor.py` : fix Windows `asyncio.WindowsSelectorEventLoopPolicy` (aiomqtt/paho incompatible avec ProactorEventLoop)
+- [x] `supervisor/supervisor.py` : logging DEBUG features dans `_predict_risk()`, `--log-level` CLI
+- [x] `.env.example` : `MQTT_BROKER_HOST`, `MQTT_BROKER_PORT`, `DECISION_INTERVAL_TICKS`, `MQTT_TOPIC_ROOT`, `CLUSTER_ID`
+- [x] `docker-compose.yml` : variables MQTT + `host.docker.internal` pour Docker Desktop Windows
+- [x] `tests/test_phase7_supervisor.py` : 18 tests -- `OnlineFeatureBuffer` (7), `MqttTelemetryConsumer` (5), helpers superviseur (6)
+- [x] `tests/test_phase6_supervisor.py` : mise a jour compatibilite Phase 7 (suppression `snapshot_to_series`, `OnlineFeatureBuffer`)
+- [x] `tests/conftest.py` : isolation stubs xgboost entre modules de test
+- [x] `notebooks/06_phase7_mqtt_supervision.ipynb` : analyse MQTT live, features, decisions, comparaison vitesses
 
-**Livrables attendus :**
+**Livrables :**
 - `supervisor/mqtt_telemetry.py`
-- `supervisor/supervisor.py` refactorisé
-- `tests/test_phase7_supervisor.py`
-- Mise à jour `docker-compose.yml`, `.env.example`
+- `supervisor/supervisor.py` refactorise (721 lignes)
+- `tests/test_phase7_supervisor.py` (18 tests)
+- `tests/conftest.py`
+- `notebooks/06_phase7_mqtt_supervision.ipynb`
+- Mise a jour `docker-compose.yml`, `.env.example`
+
+### Commandes Phase 7
+```bash
+# Tests complets
+pytest -q  # 147 passed, 3 skipped (gradient_boosting sans xgboost)
+
+# Supervisor MQTT (jumeaux-chauds + broker MQTT actifs)
+python -m supervisor.supervisor --mode ml --duration 120 --dry-run --log-level DEBUG
+python -m supervisor.supervisor --mode ml --duration 300
+
+# Via Docker
+docker compose up supervisor
+
+# Notebook analyse MQTT
+jupyter notebook notebooks/06_phase7_mqtt_supervision.ipynb
+```
 
 ---
 

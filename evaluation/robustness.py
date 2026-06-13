@@ -250,7 +250,7 @@ def main() -> None:
     print_robustness(results)
 
     RESULTS_DIR.mkdir(parents=True, exist_ok=True)
-    out_path = args.output or str(RESULTS_DIR / "robustness_results.json")
+    out_path = args.output or str(RESULTS_DIR / f"robustness_results_{args.label}.json")
     with open(out_path, "w") as f:
         json.dump({"label": args.label, "results": results}, f, indent=2)
     print(f"\nRésultats sauvegardés : {out_path}")

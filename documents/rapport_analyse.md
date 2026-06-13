@@ -3,7 +3,7 @@
 **Projet M2 Data/IA — LaPlateforme_**  
 **Auteur :** Tristan Vanrullen  
 **Date :** Juin 2026  
-**Version :** 1.0
+**Version :** 1.1
 
 ---
 
@@ -109,31 +109,73 @@ Le mode ML (logistic + supervised + override RPM_HIGH quand risk≥0.60) apporte
 
 Le scénario **stress** est le plus exigeant (RPM moyen ML = 4154, ΔRPM = +2777). L'action accuracy légèrement plus faible (0.723 vs 0.800) s'explique par la présence de la classe 4 (RPM=4500) absente des autres scénarios d'entraînement.
 
-### Limites et pistes d'amélioration
+### Limites corrigées en Phase 7
 
-1. **Features online limitées** : en temps réel, les features rolling (30s, 60s) ne sont pas disponibles — elles sont approximées par la valeur instantanée. Une fenêtre glissante en mémoire améliorerait la qualité des décisions.
+Les limites 1 et 4 ont été résolues :
+
+1. ~~**Features online limitées**~~ → **Résolu Phase 7** : `OnlineFeatureBuffer` maintient une fenêtre glissante de 70 ticks par machine. Toutes les features rolling (temp_delta_5/15/30s, temp_rolling_mean/std, margin_to_shutdown) sont calculées correctement en temps réel.
+
+4. ~~**Test en conditions réelles**~~ → **Phase 7 livrée** : le superviseur a été testé en live contre jumeaux-chauds. Voir section 5.
+
+Limites restantes :
 
 2. **Score controller à corriger** : le contrôleur à score multi-objectif nécessite un plancher RPM ou un rebalancement des poids lorsque la température est basse.
 
 3. **Généralisation inter-scénarios** : entraîner sur tous les scénarios améliorerait l'accuracy sur `stress` (classe 4 sous-représentée).
 
-4. **Test en conditions réelles** : le benchmark offline est une borne supérieure — en conditions réelles, la latence MQTT/REST et le bruit des capteurs dégraderont légèrement les performances.
+---
+
+## 5. Phase 7 — Superviseur robuste et télémétrie MQTT
+
+### Problèmes identifiés lors des tests live Phase 6
+
+| Problème | Cause | Impact |
+|----------|-------|--------|
+| risk=0.00 constant | Features glissantes toujours nulles (snapshot unique) | Prédicteur aveugle aux montées en température |
+| Fréquence inadaptée | REST toutes les 5s réelles, simulation à 1 tick/s simulé | Features calculées sur des fenêtres 5x à 300x trop larges |
+| speed_multiplier non rafraichi | Lecture de `/cluster/status` (champ absent) | Superviseur ignore les changements de vitesse Streamlit |
+| Windows asyncio | ProactorEventLoop incompatible avec aiomqtt/paho | `NotImplementedError: add_reader` au démarrage |
+
+### Solutions implémentées
+
+**OnlineFeatureBuffer** (`supervisor/online_features.py`) : fenêtre glissante de 70 ticks par machine, alignée exactement sur `features/temporal.py`. Recalcule toutes les features rolling à chaque tick MQTT entrant.
+
+**MqttTelemetryConsumer** (`supervisor/mqtt_telemetry.py`) : subscriber asyncio (aiomqtt), topic `dt/{cluster}/+/telemetry`. Alimente le buffer au rythme de la simulation (1 msg/s simulé), quelle que soit la vitesse. Sous-échantillonnage des décisions via `decision_interval_ticks` (défaut 5 ticks = 5s simulées).
+
+**Fallback REST** : si MQTT indisponible au démarrage, le superviseur bascule automatiquement en boucle REST (comportement Phase 6). Log `[FALLBACK REST]` explicite.
+
+**Corrections superviseur** :
+- `get_speed_multiplier()` lit `/simulation/speed` (correction endpoint)
+- `_refresh_speed()` : re-lecture periodique du multiplicateur (toutes les 10 iterations MQTT / 6 iterations REST)
+- `asyncio.WindowsSelectorEventLoopPolicy` sur Windows (fix aiomqtt)
+- `--log-level` CLI argument, `LOG_LEVEL` env var
+- Logging DEBUG des features dans `_predict_risk()` pour diagnostic
+
+### Résultats tests (suite 147 tests)
+
+```
+147 passed, 3 skipped in 20.81s
+```
+
+Les 3 tests skippés sont les tests gradient_boosting qui nécessitent xgboost installé (skip propre via `importorskip`).
 
 ---
 
-## 5. Conclusion
+## 6. Conclusion
 
 Ce projet démontre qu'un couple **prédicteur logistique + contrôleur supervisé** avec override de risque surpasse significativement les approches réactives :
 
-- **Détection** : 99.9% des incidents anticipés avec 120s de préavis
+- **Détection** : 99.9% des incidents anticipés avec 120s de préavis (offline)
 - **Sécurité** : RPM ≥ 3500 garanti sur 100% des situations dangereuses
 - **Sobriété** : RPM moyen de 2681 (vs 4500 en mode "full speed" permanent)
 
 La régression logistique, malgré sa simplicité, s'avère le meilleur choix pour la production grâce à ses probabilités bien calibrées et son lead time court et fiable.
 
+La Phase 7 rend ce système opérationnel en conditions réelles : le superviseur reçoit la télémétrie à la cadence simulée via MQTT, calcule des features temporelles fidèles quelle que soit la vitesse de simulation, et reste robuste aux problèmes d'infrastructure (fallback REST, reconnexion, compatibilité Windows).
+
 ---
 
-## 6. Artefacts produits
+## 7. Artefacts produits
 
 | Artefact | Phase | Description |
 |----------|-------|-------------|
@@ -145,9 +187,13 @@ La régression logistique, malgré sa simplicité, s'avère le meilleur choix po
 | `evaluation/results/fan_control_results.json` | 5 | Métriques Phase 5 |
 | `evaluation/results/benchmark_results.json` | 6 | Benchmark comparatif |
 | `evaluation/results/robustness_results.json` | 6 | Robustesse par scénario |
-| `supervisor/supervisor.py` | 6 | Service de supervision temps réel |
+| `supervisor/supervisor.py` | 6-7 | Service de supervision temps réel (721 lignes) |
+| `supervisor/online_features.py` | 7 | OnlineFeatureBuffer -- fenetre glissante 70 ticks |
+| `supervisor/mqtt_telemetry.py` | 7 | MqttTelemetryConsumer -- subscriber asyncio aiomqtt |
+| `tests/conftest.py` | 7 | Isolation stubs xgboost entre modules de test |
 | `notebooks/01_ingestion_eda.ipynb` | 2 | EDA données brutes |
 | `notebooks/02_feature_engineering.ipynb` | 3 | Exploration features |
 | `notebooks/03_failure_prediction.ipynb` | 4 | Modèles prédictifs |
 | `notebooks/04_fan_control.ipynb` | 5 | Contrôleurs de régulation |
 | `notebooks/05_evaluation_comparative.ipynb` | 6 | Évaluation finale |
+| `notebooks/06_phase7_mqtt_supervision.ipynb` | 7 | Analyse MQTT live, features, decisions |

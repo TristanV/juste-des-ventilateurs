@@ -1,7 +1,7 @@
-"""Superviseur de régulation thermique — Juste des Ventilateurs.
+"""Superviseur de régulation thermique -- Juste des Ventilateurs.
 
 Boucle principale de décision en temps réel :
-  1. Recevoir la télémétrie via MQTT (consumer asyncio) → OnlineFeatureBuffer
+  1. Recevoir la télémétrie via MQTT (consumer asyncio) -> OnlineFeatureBuffer
   2. Tous les decision_interval_ticks ticks simulés :
      a. Extraire les features enrichies (fenêtres glissantes)
      b. Évaluer le risque de panne (prédicteur logistique)
@@ -41,16 +41,16 @@ from supervisor.decision_logger import DecisionLogger
 from supervisor.online_features import OnlineFeatureBuffer
 
 # ---------------------------------------------------------------------------
-# Configuration des logs — silencer httpx, reformater le superviseur
+# Configuration des logs -- silencer httpx, reformater le superviseur
 # ---------------------------------------------------------------------------
 
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s — %(message)s",
+    format="%(asctime)s [%(levelname)s] %(name)s -- %(message)s",
 )
 logger = logging.getLogger("supervisor")
 
-# httpx est très verbeux (une ligne par requête HTTP 200) — passer en WARNING
+# httpx est très verbeux (une ligne par requête HTTP 200) -- passer en WARNING
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
 
@@ -62,12 +62,12 @@ RPM_LEVELS     = [0, 1500, 2500, 3500, 4500]
 RPM_HIGH       = 4500    # RPM d'urgence quand risk_score > threshold
 RPM_DEFAULT    = 2500    # RPM de sécurité si aucune décision possible
 RPM_MIN        = 800     # Plancher : ventilation minimale même à froid
-RISK_THRESHOLD = 0.60    # Seuil de surcharge risque → RPM_HIGH
+RISK_THRESHOLD = 0.60    # Seuil de surcharge risque -> RPM_HIGH
 
 # Seuil de risk_score à partir duquel on logue une machine en INFO
 RISK_LOG_THRESHOLD = float(os.environ.get("RISK_LOG_THRESHOLD", "0.05"))
 
-# Features attendues par le prédicteur — sous-ensemble disponible online
+# Features attendues par le prédicteur -- sous-ensemble disponible online
 ONLINE_FEATURES = [
     "temperature_c", "sensor_temp_max", "sensor_temp_mean",
     "power_w", "energy_kwh", "fan_rpm_mean",
@@ -90,13 +90,18 @@ class JumeauxClient:
             self._client = httpx.Client(timeout=timeout)
         except ImportError:
             self._client = None
-        logger.info("JumeauxClient → %s", self.base_url)
+        logger.info("JumeauxClient -> %s", self.base_url)
 
     def get_cluster_status(self) -> dict:
         return self._get("/cluster/status")
 
     def get_speed_multiplier(self) -> float:
-        """Lit le speed_multiplier courant depuis /cluster/status."""
+        """Lit le speed_multiplier depuis /simulation/speed.
+        Fallback sur /cluster/status pour retrocompatibilite.
+        """
+        info = self._get("/simulation/speed")
+        if info and "speed_multiplier" in info:
+            return float(info["speed_multiplier"])
         status = self._get("/cluster/status")
         return float(status.get("speed_multiplier", 1.0))
 
@@ -223,7 +228,7 @@ def load_controller(model_name: str = "supervised"):
 # ---------------------------------------------------------------------------
 
 def _machines_from_cluster(cluster: dict) -> dict[str, dict]:
-    """Normalise machines dict ou liste → {machine_id: snapshot}."""
+    """Normalise machines dict ou liste -> {machine_id: snapshot}."""
     machines_raw = cluster.get("machines", {})
     if isinstance(machines_raw, list):
         return {m.get("machine_id", m.get("id", f"machine_{i}")): m
@@ -264,7 +269,7 @@ class Supervisor:
     predictor_name          : nom du modèle prédictif
     controller_name         : nom du contrôleur
     label                   : label de panne cible
-    risk_threshold          : seuil risk_score → RPM_HIGH
+    risk_threshold          : seuil risk_score -> RPM_HIGH
     api_url                 : URL de l'API jumeaux-chauds
     mqtt_host / mqtt_port   : broker MQTT (Option E)
     decision_interval_ticks : décision toutes les N ticks simulés (MQTT)
@@ -302,6 +307,17 @@ class Supervisor:
         self.predictor  = load_predictor(predictor_name, label) if mode == "ml" else None
         self.controller = load_controller(controller_name)       if mode == "ml" else None
 
+        # Ordre des features attendu par le modele (depuis le splitter d'entrainement)
+        self._feature_order: list[str] | None = None
+        if self.predictor is not None:
+            try:
+                from models.failure_prediction.splitter import TemporalSplitter
+                r = TemporalSplitter().split()
+                self._feature_order = list(r[0].columns)
+                logger.info("Feature order charge : %d features", len(self._feature_order))
+            except Exception as e:
+                logger.warning("Impossible de charger l'ordre des features : %s", e)
+
         self._feat_buffer = OnlineFeatureBuffer()
         self._prev_rpm: dict[str, int] = {}
 
@@ -317,7 +333,7 @@ class Supervisor:
         # Déduplication des warnings répétitifs
         self._warn_counts: dict[str, int] = {}
 
-        logger.info("Supervisor prêt — mode=%s  dry_run=%s", mode, dry_run)
+        logger.info("Supervisor prêt -- mode=%s  dry_run=%s", mode, dry_run)
 
     # ------------------------------------------------------------------
     # Prédiction et décision
@@ -328,11 +344,24 @@ class Supervisor:
             return 0.0
         import pandas as pd
         X = pd.DataFrame([state_series])
+        # Reordonner les colonnes selon l'ordre d'entrainement
+        if self._feature_order is not None:
+            X = X.reindex(columns=self._feature_order, fill_value=0.0)
         try:
             proba = self.predictor.predict_proba(X)
-            return float(proba[0, 1])
+            risk  = float(proba[0, 1])
+            logger.debug(
+                "predict_proba  T=%.1f  d5s=%.3f  d30s=%.3f  margin=%.1f  load=%.2f  -> risk=%.4f",
+                float(state_series.get("temperature_c", 0)),
+                float(state_series.get("temp_delta_5s", 0)),
+                float(state_series.get("temp_delta_30s", 0)),
+                float(state_series.get("margin_to_shutdown", 0)),
+                float(state_series.get("load_estimated", 0)),
+                risk,
+            )
+            return risk
         except Exception as e:
-            logger.debug("predict_proba échoué : %s", e)
+            logger.warning("predict_proba echoue : %s", e)
             return 0.0
 
     def _decide_rpm(self, state_series: "pd.Series", risk_score: float) -> int:
@@ -404,18 +433,18 @@ class Supervisor:
             risk_tag = " [RISK OVERRIDE]" if entry["risk_override"] else ""
             dry_tag  = " [DRY RUN]" if self.dry_run else ""
             logger.info(
-                "  %-20s  T=%5.1f°C  risk=%.2f  RPM %d→%d%s%s",
+                "  %-20s  T=%5.1f degC  risk=%.2f  RPM %d->%d%s%s",
                 machine_id, temp_c, risk, prev_rpm, rpm, risk_tag, dry_tag,
             )
         elif risk > RISK_LOG_THRESHOLD:
             # Log INFO : risque notable même sans changement RPM
             logger.info(
-                "  %-20s  T=%5.1f°C  risk=%.2f  RPM %d (stable)",
+                "  %-20s  T=%5.1f degC  risk=%.2f  RPM %d (stable)",
                 machine_id, temp_c, risk, rpm if rpm >= 0 else prev_rpm,
             )
         else:
             logger.debug(
-                "  %-20s  T=%5.1f°C  risk=%.2f  RPM %d",
+                "  %-20s  T=%5.1f degC  risk=%.2f  RPM %d",
                 machine_id, temp_c, risk, rpm if rpm >= 0 else prev_rpm,
             )
 
@@ -445,7 +474,7 @@ class Supervisor:
             elapsed  = getattr(self, "_t_elapsed", 0)
             speed    = getattr(self, "_speed_multiplier", 1.0)
             logger.info(
-                "[t=%ds speed=%.0fx]  cluster — %d on  T_max=%.1f°C  risk_max=%.2f",
+                "[t=%ds speed=%.0fx]  cluster -- %d on  T_max=%.1f degC  risk_max=%.2f",
                 elapsed, speed, n_on, t_max, risk_max,
             )
         return results
@@ -454,7 +483,7 @@ class Supervisor:
         """Cycle de décision en fallback REST (alimenter buffer + décider)."""
         cluster = self.client.get_cluster_status()
         if not cluster:
-            self._log_warning_dedup("cluster_empty", "cluster/status vide — skip cycle")
+            self._log_warning_dedup("cluster_empty", "cluster/status vide -- skip cycle")
             return []
 
         machines = _machines_from_cluster(cluster)
@@ -478,7 +507,7 @@ class Supervisor:
             elapsed  = getattr(self, "_t_elapsed", 0)
             speed    = getattr(self, "_speed_multiplier", 1.0)
             logger.info(
-                "[t=%ds speed=%.0fx]  cluster — %d on  T_max=%.1f°C  risk_max=%.2f  [REST]",
+                "[t=%ds speed=%.0fx]  cluster -- %d on  T_max=%.1f degC  risk_max=%.2f  [REST]",
                 elapsed, speed, n_on, t_max, risk_max,
             )
         return results
@@ -489,7 +518,7 @@ class Supervisor:
 
     async def _run_async(self, duration_s: float | None = None) -> None:
         """Boucle principale async : consumer MQTT + loop de décision."""
-        logger.info("=== Supervisor démarré — mode=%s ===", self.mode)
+        logger.info("=== Supervisor démarré -- mode=%s ===", self.mode)
         if self.dry_run:
             logger.info("  [DRY RUN] Aucune commande ne sera envoyée")
 
@@ -509,10 +538,10 @@ class Supervisor:
         mqtt_ready = await self._mqtt.wait_ready(timeout=10.0)
 
         if mqtt_ready:
-            logger.info("  Mode MQTT — buffer alimenté à la cadence simulée")
+            logger.info("  Mode MQTT -- buffer alimenté à la cadence simulée")
             await self._loop_mqtt(duration_s)
         else:
-            logger.info("  Mode REST fallback — lecture API toutes les %.0fs", self.decision_interval_s)
+            logger.info("  Mode REST fallback -- lecture API toutes les %.0fs", self.decision_interval_s)
             await self._loop_rest(duration_s)
 
         # Arrêt propre
@@ -529,13 +558,25 @@ class Supervisor:
         self.dec_logger.close()
         logger.info("=== Supervisor arrêté ===")
 
+    def _refresh_speed(self) -> None:
+        """Relit speed_multiplier depuis /simulation/speed et logue si changement."""
+        try:
+            new_speed = self.client.get_speed_multiplier()
+        except Exception:
+            return
+        if new_speed != self._speed_multiplier:
+            logger.info("  speed_multiplier change : %.0fx -> %.0fx",
+                        self._speed_multiplier, new_speed)
+            self._speed_multiplier = new_speed
+
     async def _loop_mqtt(self, duration_s: float | None) -> None:
-        """Boucle de décision pilotée par les ticks MQTT."""
+        """Boucle de decision pilotee par les ticks MQTT."""
         t_start  = time.monotonic()
         self._t_elapsed = 0
+        _cycle = 0
+        _speed_refresh_interval = 10
 
-        # Attendre le premier message pour initialiser les machines
-        logger.info("  En attente des premiers ticks MQTT…")
+        logger.info("  En attente des premiers ticks MQTT...")
         await asyncio.sleep(2.0)
 
         try:
@@ -544,6 +585,10 @@ class Supervisor:
                 self._t_elapsed = int(elapsed * self._speed_multiplier)
                 if duration_s is not None and elapsed >= duration_s:
                     break
+
+                _cycle += 1
+                if _cycle % _speed_refresh_interval == 0:
+                    self._refresh_speed()
 
                 results = []
                 for machine_id in list(self._feat_buffer.machines()):
@@ -558,7 +603,7 @@ class Supervisor:
                     t_max    = max(r["temperature_c"] for r in results)
                     risk_max = max(r["risk_score"] for r in results)
                     logger.info(
-                        "[t=%ds speed=%.0fx]  cluster — %d machines  T_max=%.1f°C  risk_max=%.2f",
+                        "[t=%ds speed=%.0fx]  cluster -- %d machines  T_max=%.1f C  risk_max=%.2f",
                         self._t_elapsed, self._speed_multiplier, len(results), t_max, risk_max,
                     )
 
@@ -571,19 +616,28 @@ class Supervisor:
         """Boucle de decision en fallback REST."""
         t_start = time.monotonic()
         self._t_elapsed = 0
+        _cycle = 0
+        _speed_refresh_interval = 6
         try:
             while True:
                 elapsed = time.monotonic() - t_start
                 self._t_elapsed = int(elapsed)
                 if duration_s is not None and elapsed >= duration_s:
                     break
+                _cycle += 1
+                if _cycle % _speed_refresh_interval == 0:
+                    self._refresh_speed()
                 self._decision_cycle_rest()
                 await asyncio.sleep(self.decision_interval_s)
         except asyncio.CancelledError:
             pass
 
     def run(self, duration_s: float | None = None) -> None:
-        """Point d'entree synchrone — lance la boucle async."""
+        """Point d'entree synchrone -- lance la boucle async.
+        Sur Windows, force SelectorEventLoop (aiomqtt/paho incompatible avec ProactorEventLoop).
+        """
+        if sys.platform == "win32":
+            asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
         try:
             asyncio.run(self._run_async(duration_s))
         except KeyboardInterrupt:
@@ -629,7 +683,7 @@ class Supervisor:
 # ---------------------------------------------------------------------------
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Superviseur ML — Juste des Ventilateurs")
+    parser = argparse.ArgumentParser(description="Superviseur ML -- Juste des Ventilateurs")
     parser.add_argument("--mode",        default=os.getenv("SUPERVISOR_MODE", "ml"),
                         choices=["ml", "threshold", "native"])
     parser.add_argument("--predictor",   default=os.getenv("PREDICTOR_MODEL", "logistic"))
@@ -648,21 +702,29 @@ def main() -> None:
     parser.add_argument("--risk-threshold", type=float, default=RISK_THRESHOLD)
     parser.add_argument("--run-name",    default="supervisor")
     parser.add_argument("--dry-run",     action="store_true")
+    parser.add_argument("--log-level",   default=os.getenv("LOG_LEVEL", "INFO"),
+                        choices=["DEBUG", "INFO", "WARNING", "ERROR"],
+                        help="Niveau de log (defaut: INFO)")
     args = parser.parse_args()
+
+    logging.basicConfig(
+        level=getattr(logging, args.log_level),
+        format="%(asctime)s [%(levelname)s] %(name)s -- %(message)s",
+        force=True,
+    )
 
     sup = Supervisor(
         mode                    = args.mode,
-        predictor_name          = args.predictor,
-        controller_name         = args.controller,
-        label                   = args.label,
-        risk_threshold          = args.risk_threshold,
         api_url                 = args.api_url,
         mqtt_host               = args.mqtt_host,
         mqtt_port               = args.mqtt_port,
-        decision_interval_ticks = args.interval_ticks,
-        decision_interval_s     = args.interval,
-        log_dir                 = _DEFAULT_LOG_DIR,
-        run_name                = args.run_name,
+        predictor_name          = args.predictor,
+        controller_name         = args.controller,
+        label                   = args.label,
+        decision_interval_ticks = args.decision_interval_ticks,
+        decision_interval_s     = args.decision_interval_s,
+        risk_threshold          = float(os.getenv("RISK_THRESHOLD", "0.6")),
+        risk_log_threshold      = float(os.getenv("RISK_LOG_THRESHOLD", "0.05")),
         dry_run                 = args.dry_run,
     )
     sup.run(duration_s=args.duration)

@@ -32,7 +32,7 @@ PARAM_GRID = [
     {"n_estimators": 200, "max_depth": 15},
     {"n_estimators": 200, "max_depth": 20},
 ]
-THRESHOLD_GRID = [0.3, 0.35, 0.4, 0.45, 0.5, 0.55, 0.6]
+THRESHOLD_GRID = [0.05, 0.08, 0.10, 0.12, 0.15, 0.18, 0.20, 0.25, 0.30, 0.35, 0.40, 0.45, 0.50]
 
 
 class RandomForestPredictor:
@@ -159,26 +159,39 @@ class RandomForestPredictor:
         for params in PARAM_GRID:
             m = self._build(params["n_estimators"], params["max_depth"])
             m.fit(X_tr, y_tr)
-            y_pred = (m.predict_proba(X_v)[:, 1] >= 0.5).astype(int)
-            rec = recall_score(y_v, y_pred, zero_division=0)
-            if rec >= self.recall_target:
-                f1 = f1_score(y_v, y_pred, zero_division=0)
-                if f1 > best_f1:
-                    best_f1, best_params = f1, params
+            proba_v = m.predict_proba(X_v)[:, 1]
+            # Chercher le meilleur seuil satisfaisant recall_target
+            for thr in THRESHOLD_GRID:
+                y_pred = (proba_v >= thr).astype(int)
+                rec = recall_score(y_v, y_pred, zero_division=0)
+                if rec >= self.recall_target:
+                    f1 = f1_score(y_v, y_pred, zero_division=0)
+                    if f1 > best_f1:
+                        best_f1, best_params = f1, params
+                    break  # seuil le plus haut satisfaisant recall trouvé
         return best_params
 
     def _select_threshold(self, X_val: pd.DataFrame, y_val: pd.Series) -> float:
         proba = self.predict_proba(X_val)[:, 1]
         y_v = y_val.values
         best_thr, best_f1 = 0.5, -1.0
+        fallback_thr, fallback_rec = 0.5, -1.0  # meilleur recall si cible non atteinte
         for thr in THRESHOLD_GRID:
             y_pred = (proba >= thr).astype(int)
             rec = recall_score(y_v, y_pred, zero_division=0)
+            if rec > fallback_rec:
+                fallback_thr, fallback_rec = thr, rec
             if rec >= self.recall_target:
                 f1 = f1_score(y_v, y_pred, zero_division=0)
                 if f1 > best_f1:
                     best_f1, best_thr = f1, thr
-        return best_thr if best_f1 >= 0 else 0.5
+        if best_f1 >= 0:
+            return best_thr
+        logger.warning(
+            "Aucun seuil n'atteint Recall≥%.2f — fallback seuil %.2f (recall=%.3f)",
+            self.recall_target, fallback_thr, fallback_rec,
+        )
+        return fallback_thr
 
     @staticmethod
     def _to_array(X: pd.DataFrame | np.ndarray) -> np.ndarray:

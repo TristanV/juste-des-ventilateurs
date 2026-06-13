@@ -64,7 +64,7 @@ def add_failure_labels(
 
     # Statuts dangereux : degraded ou off causé par surchauffe
     # On identifie les indices où une panne est imminente
-    is_dangerous = _is_dangerous_status(df)
+    is_dangerous = _is_dangerous_status(df, t_shutdown_c=t_shutdown_c)
     is_hot = (df["temperature_c"] > hot_threshold).values if "temperature_c" in df.columns else np.zeros(n, dtype=bool)
 
     for horizon_s in horizons_s:
@@ -172,8 +172,22 @@ def label_names_control() -> list[str]:
 # Helpers internes
 # ---------------------------------------------------------------------------
 
-def _is_dangerous_status(df: pd.DataFrame) -> np.ndarray:
-    """Retourne un tableau bool : True si le statut est dangereux (dégradé ou shutdown)."""
+def _is_dangerous_status(
+    df: pd.DataFrame,
+    t_shutdown_c: float = 88.0,
+    ticks_since_shutdown_col: str = "ticks_since_last_shutdown",
+    hot_off_min_ticks: int = 60,
+) -> np.ndarray:
+    """Retourne un tableau bool : True si le statut est dangereux (dégradé ou shutdown thermique).
+
+    Un row "off" n'est considéré dangereux que si :
+      - temperature_c > 50% du seuil de shutdown (arrêt par surchauffe), OU
+      - ticks_since_last_shutdown < hot_off_min_ticks (machine vient juste de s'éteindre,
+        température encore potentiellement élevée)
+
+    Ceci évite de labeler comme dangereux les rows "off" de longue durée à froid
+    (machines éteintes volontairement ou déjà refroidies).
+    """
     n = len(df)
     if "status" not in df.columns:
         return np.zeros(n, dtype=bool)
@@ -181,18 +195,26 @@ def _is_dangerous_status(df: pd.DataFrame) -> np.ndarray:
     statuses = df["status"].values
     dangerous = np.zeros(n, dtype=bool)
 
+    # Seuil temperature : 50% du shutdown
+    hot_off_threshold = t_shutdown_c * 0.5
+    temps = df["temperature_c"].values if "temperature_c" in df.columns else np.zeros(n)
+    ticks_since = (
+        df[ticks_since_shutdown_col].values
+        if ticks_since_shutdown_col in df.columns
+        else np.full(n, hot_off_min_ticks + 1, dtype=int)
+    )
+
     for i, s in enumerate(statuses):
         if s == "degraded":
             dangerous[i] = True
         elif s == "off":
-            # "off" est dangereux seulement si c'est un shutdown thermique
-            # On le détecte via status_cause si disponible
+            # "off" dangereux seulement si surchauffe probable
             if "status_cause" in df.columns:
                 cause = df["status_cause"].iloc[i]
                 if pd.notna(cause) and "overheat" in str(cause):
                     dangerous[i] = True
-            else:
-                # Sans cause explicite, on considère tout "off" comme potentiellement dangereux
+            # Heuristique : T > seuil basse OU shutdown recent
+            if temps[i] > hot_off_threshold or int(ticks_since[i]) < hot_off_min_ticks:
                 dangerous[i] = True
 
     return dangerous

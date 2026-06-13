@@ -175,6 +175,27 @@ def add_contextual_features(
                 recovering[i] = 1
         df["is_recovering"] = recovering
 
+    # ------------------------------------------------------------------
+    # 8. Features de statut one-hot + durée cumulée en état "off"
+    # ------------------------------------------------------------------
+    if "status" in df.columns:
+        statuses_s = df["status"]
+        df["is_on"]       = (statuses_s == "on").astype(int)
+        df["is_degraded"] = (statuses_s == "degraded").astype(int)
+        df["is_off"]      = (statuses_s == "off").astype(int)
+
+        # Duree cumulee en etat "off" (reinitialisee des retour en "on" ou "degraded")
+        in_off = (statuses_s == "off").astype(float).values
+        time_in_off = np.zeros(n)
+        cumulative = 0.0
+        for i, off in enumerate(in_off):
+            if off:
+                cumulative += dt
+            else:
+                cumulative = 0.0
+            time_in_off[i] = cumulative
+        df["time_in_off_s"] = time_in_off
+
     return df
 
 
@@ -193,4 +214,8 @@ def feature_names_contextual() -> list[str]:
         "fan_mode_manual",
         "rpm_changes_last_60s",
         "is_recovering",
+        "is_on",
+        "is_degraded",
+        "is_off",
+        "time_in_off_s",
     ]

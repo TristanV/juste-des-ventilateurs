@@ -10,8 +10,21 @@ services:
     env_file: .env
     environment:
       # Sur Docker Desktop Windows, network_mode:host est ignore.
-      # host.docker.internal pointe vers l'hote Windows (jumeaux-chauds API).
+      # host.docker.internal pointe vers l'hote Windows (jumeaux-chauds API + MQTT).
       - API_BASE_URL=http://host.docker.internal:8000
+      # Broker MQTT de jumeaux-chauds
+      - MQTT_BROKER_HOST=host.docker.internal
+      - MQTT_BROKER_PORT=1883
+      # Identifiant du cluster (doit correspondre aux topics MQTT de jumeaux-chauds)
+      - CLUSTER_ID=cluster_alpha
+      - MQTT_TOPIC_ROOT=dt
+      # Sous-echantillonnage : decision toutes les N secondes simulees
+      - DECISION_INTERVAL_TICKS=5
+      # Intervalle REST fallback (si MQTT indisponible)
+      - DECISION_INTERVAL_S=5
+      # Seuils de log et de risque
+      - RISK_LOG_THRESHOLD=0.05
+      - RISK_THRESHOLD=0.6
     volumes:
       - ./data:/app/data
       - ./models:/app/models

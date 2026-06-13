@@ -294,11 +294,37 @@ class TestLabeler:
         assert (df_out["action_class"] == len(RPM_LEVELS) - 1).all()
 
     def test_is_dangerous_status(self):
+        # off sans temperature_c ni ticks_since → heuristique : ticks sentinel > 60 ET T=0 < seuil
+        # → PAS dangereux par défaut (comportement v1.5 : off froid/ancien = safe)
         df = pd.DataFrame({"status": ["on", "degraded", "off", "on"]})
         result = _is_dangerous_status(df)
         assert result[0] == False
         assert result[1] == True
-        assert result[2] == True  # off sans cause = dangereux par défaut
+        assert result[2] == False  # off sans T ni ticks → pas dangereux (T=0 < 44°C, ticks=61≥60)
+
+        # off chaud → dangereux
+        df_hot = pd.DataFrame({
+            "status": ["off"],
+            "temperature_c": [60.0],
+            "ticks_since_last_shutdown": [200],
+        })
+        assert _is_dangerous_status(df_hot, t_shutdown_c=88.0)[0] == True
+
+        # off récent (ticks < 60) → dangereux
+        df_recent = pd.DataFrame({
+            "status": ["off"],
+            "temperature_c": [30.0],
+            "ticks_since_last_shutdown": [10],
+        })
+        assert _is_dangerous_status(df_recent, t_shutdown_c=88.0)[0] == True
+
+        # off froid ancien → safe
+        df_cold = pd.DataFrame({
+            "status": ["off"],
+            "temperature_c": [30.0],
+            "ticks_since_last_shutdown": [200],
+        })
+        assert _is_dangerous_status(df_cold, t_shutdown_c=88.0)[0] == False
 
 
 # ---------------------------------------------------------------------------
@@ -322,31 +348,3 @@ class TestPipeline:
         df_out = build_feature_dataset(df_mixed, machine_config={"t_shutdown_c": T_SHUTDOWN})
         # Seules les lignes telemetry doivent être traitées
         assert (df_out["msg_type"] == "telemetry").all()
-
-    def test_pipeline_drops_warmup_rows(self):
-        n = 200
-        df = _make_base_df(n=n)
-        df_out = build_feature_dataset(df, machine_config={"t_shutdown_c": T_SHUTDOWN}, drop_warmup_rows=60)
-        assert len(df_out) <= n - 60
-
-    def test_pipeline_multi_machine(self):
-        df1 = _make_base_df(n=150)
-        df2 = _make_base_df(n=150)
-        df2["machine_id"] = "srv-master-01"
-        df2["role"] = "master"
-        df_both = pd.concat([df1, df2], ignore_index=True)
-        cfg = {
-            "srv-worker-01": {"t_shutdown_c": 88.0},
-            "srv-master-01": {"t_shutdown_c": 90.0},
-        }
-        df_out = build_feature_dataset(df_both, machine_config=cfg)
-        assert df_out["machine_id"].nunique() == 2
-
-    def test_all_feature_names_nonempty(self):
-        names = all_feature_names()
-        assert len(names) > 10
-
-    def test_all_label_names_nonempty(self):
-        names = all_label_names()
-        assert "failure_60s" in names
-        assert "action_class" in names

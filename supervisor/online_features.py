@@ -78,6 +78,8 @@ class OnlineFeatureBuffer:
         self._ticks_since_shutdown: dict[str, int] = {}
         self._ticks_since_fault:    dict[str, int] = {}
         self._time_in_hot_s:        dict[str, float] = {}
+        self._time_in_degraded_s:   dict[str, float] = {}
+        self._time_in_off_s:        dict[str, float] = {}
         self._energy_fans_kwh:      dict[str, float] = {}
 
     # ------------------------------------------------------------------
@@ -97,9 +99,11 @@ class OnlineFeatureBuffer:
             self._nb_shutdowns[machine_id]         = 0
             self._nb_degraded[machine_id]          = 0
             self._prev_status[machine_id]          = "on"
-            self._ticks_since_shutdown[machine_id] = 9999
-            self._ticks_since_fault[machine_id]    = 9999
+            self._ticks_since_shutdown[machine_id] = 11082  # max observe en train
+            self._ticks_since_fault[machine_id]    = 11082
             self._time_in_hot_s[machine_id]        = 0.0
+            self._time_in_degraded_s[machine_id]   = 0.0
+            self._time_in_off_s[machine_id]        = 0.0
             self._energy_fans_kwh[machine_id]      = 0.0
 
         raw = self._extract_raw(snapshot)
@@ -143,6 +147,7 @@ class OnlineFeatureBuffer:
         rpm_std     = float(cur.get("fan_rpm_std", 0.0))
         load        = float(cur.get("load_estimated", 0.5))
         fan_count   = float(cur.get("fan_count", 2))
+        fan_mode_manual = int(cur.get("fan_mode_manual", 0))
         status      = str(cur.get("status", "on"))
 
         # ---- séries temporelles ----
@@ -163,7 +168,7 @@ class OnlineFeatureBuffer:
         temp_std_30s    = _tail_std(temps, w30)
 
         margin          = _T_SHUTDOWN_C - temp_c
-        margin_pct      = max(0.0, margin / _T_SHUTDOWN_C)
+        margin_pct      = max(0.0, margin / _T_SHUTDOWN_C * 100.0)  # en %, aligné features/temporal.py
         margin_delta_30s = -temp_delta_30s  # positif = danger croissant
 
         load_rm_30s     = _tail_mean(loads, w30)
@@ -171,6 +176,16 @@ class OnlineFeatureBuffer:
 
         rpm_delta_15s   = _delta(rpms, w15)
         rpm_rm_30s      = _tail_mean(rpms, w30)
+
+        # rpm_variance, rpm_cv (sur fenetre 30s)
+        rpms_30 = rpms[max(0, n - w30):]
+        rpm_variance = float(np.var(rpms_30)) if len(rpms_30) >= 2 else 0.0
+        rpm_cv = (float(np.std(rpms_30) / np.mean(rpms_30))
+                  if len(rpms_30) >= 2 and np.mean(rpms_30) > 0 else 0.0)
+
+        # rpm_changes_last_60s : nombre de changements de consigne sur 60 ticks
+        rpms_60 = rpms[max(0, n - w60):]
+        rpm_changes_last_60s = float(int(np.sum(np.abs(np.diff(rpms_60)) > 50)))  # seuil 50 RPM
 
         power_rm_30s    = _tail_mean(powers, w30)
         power_delta_30s = _delta(powers, w30)
@@ -183,8 +198,10 @@ class OnlineFeatureBuffer:
         rpm_ratio = min(1.0, rpm_mean / _FAN_MAX_RPM)
         power_fans_w = fan_p_nom * (rpm_ratio ** 3) * fan_count
         power_compute_w = max(0.0, power_w - power_fans_w)
-        fan_energy_ratio = (power_fans_w / power_w) if power_w > 0 else 0.0
+        fan_energy_ratio = float(np.clip(power_fans_w / power_w, 0.0, 1.0)) if power_w > 0 else 0.0  # aligné features/energy.py
         pue_estimated = (1.0 + power_fans_w / power_compute_w) if power_compute_w > 0 else _PUE_BASELINE
+        # energy_per_temp_unit = power_fans_w / margin_to_shutdown (aligné features/energy.py)
+        energy_per_temp_unit = (power_fans_w / margin) if margin > 0 else 0.0
 
         # power_fans rolling 30s : recalcul sur la fenêtre
         fan_p_series = np.array([
@@ -194,7 +211,9 @@ class OnlineFeatureBuffer:
         power_fans_rm_30s = _tail_mean(fan_p_series, w30)
 
         pue_series = np.array([
-            (1.0 + fp / max(0.001, h.get("power_w", 0.0) - fp))
+            (1.0 + fp / (h.get("power_w", 0.0) - fp))
+            if (h.get("power_w", 0.0) - fp) > 0
+            else _PUE_BASELINE
             for h, fp in zip(hist, fan_p_series)
         ], dtype=float)
         pue_rm_30s = _tail_mean(pue_series, w30)
@@ -209,13 +228,19 @@ class OnlineFeatureBuffer:
         ticks_shutdown = self._ticks_since_shutdown[machine_id]
         ticks_fault    = self._ticks_since_fault[machine_id]
 
-        has_fan_fault   = int(cur.get("has_fan_fault", 0))
-        has_power_surge = int(cur.get("has_power_surge", 0))
-        is_recovering   = int(
+        has_fan_fault    = int(cur.get("has_fan_fault", 0))
+        has_power_surge  = int(cur.get("has_power_surge", 0))
+        has_sensor_drift = int(cur.get("has_sensor_drift", 0))
+        is_recovering    = int(
             status == "on" and self._prev_status.get(machine_id, "on") in ("off", "degraded")
         )
 
-        # ---- assemblage final ----
+        # ---- features de statut one-hot ----
+        is_on       = int(status == "on")
+        is_degraded = int(status == "degraded")
+        is_off      = int(status == "off")
+
+        # ---- assemblage final (51 features : 47 + 4 nouvelles features statut) ----
         return pd.Series({
             # scalaires courants
             "temperature_c":                temp_c,
@@ -225,8 +250,8 @@ class OnlineFeatureBuffer:
             "energy_kwh":                   energy_kwh,
             "fan_rpm_mean":                 rpm_mean,
             "fan_rpm_std":                  rpm_std,
-            "fan_count":                    fan_count,
             "load_estimated":               load,
+            "fan_mode_manual":              fan_mode_manual,
             # temporelles
             "temp_delta_5s":                temp_delta_5s,
             "temp_delta_15s":               temp_delta_15s,
@@ -241,17 +266,22 @@ class OnlineFeatureBuffer:
             "load_rolling_mean_60s":        load_rm_60s,
             "rpm_delta_15s":                rpm_delta_15s,
             "rpm_rolling_mean_30s":         rpm_rm_30s,
+            "rpm_variance":                 rpm_variance,
+            "rpm_cv":                       rpm_cv,
+            "rpm_changes_last_60s":         rpm_changes_last_60s,
             "power_rolling_mean_30s":       power_rm_30s,
             "power_delta_30s":              power_delta_30s,
+            "power_compute_w":              power_compute_w,
             "sensor_max_delta_15s":         sm_delta_15s,
             "sensor_max_rolling_mean_30s":  sm_rm_30s,
-            # énergétiques
+            # energetiques
             "power_fans_w":                 power_fans_w,
             "fan_energy_ratio":             fan_energy_ratio,
             "pue_estimated":                pue_estimated,
             "power_fans_rolling_mean_30s":  power_fans_rm_30s,
             "pue_rolling_mean_30s":         pue_rm_30s,
             "energy_fans_kwh_cumulated":    energy_fans_kwh_cum,
+            "energy_per_temp_unit":         energy_per_temp_unit,
             # contextuelles
             "time_in_hot_zone_s":           time_in_hot,
             "nb_shutdowns_episode":         nb_shutdowns,
@@ -259,12 +289,15 @@ class OnlineFeatureBuffer:
             "ticks_since_last_shutdown":    ticks_shutdown,
             "has_fan_fault":                has_fan_fault,
             "has_power_surge":              has_power_surge,
+            "has_sensor_drift":             has_sensor_drift,
             "ticks_since_last_fault":       ticks_fault,
             "is_recovering":                is_recovering,
-            # contexte épisode non disponible online
-            "time_in_degraded_s":           0.0,
-            "time_to_failure_s":            999.0,
-            "fault_count":                  0,
+            "time_in_degraded_s":           self._time_in_degraded_s[machine_id],
+            # statut one-hot (nouvelles features v1.5)
+            "is_on":                        is_on,
+            "is_degraded":                  is_degraded,
+            "is_off":                       is_off,
+            "time_in_off_s":                self._time_in_off_s[machine_id],
         })
 
     def machines(self) -> list[str]:
@@ -272,7 +305,7 @@ class OnlineFeatureBuffer:
         return list(self._history.keys())
 
     # ------------------------------------------------------------------
-    # Helpers privés
+    # Helpers prives
     # ------------------------------------------------------------------
 
     def _extract_raw(self, snapshot: dict) -> dict[str, Any]:
@@ -299,6 +332,10 @@ class OnlineFeatureBuffer:
         faults = snapshot.get("faults", [])
         fault_types = [f.get("type", "") for f in faults] if faults else []
 
+        fan_mode = str(snapshot.get("fan_mode", "auto"))
+        if fan_mode == "auto" and isinstance(fans, list) and fans:
+            fan_mode = str(fans[0].get("mode", "auto")) if isinstance(fans[0], dict) else "auto"
+
         return {
             "temperature_c":    temp_c,
             "sensor_temp_max":  temp_max,
@@ -311,13 +348,15 @@ class OnlineFeatureBuffer:
             "load_estimated":   float(snapshot.get("load_estimated", snapshot.get("load", 0.5))),
             "status":           str(snapshot.get("status", "on")),
             "role":             str(snapshot.get("role", "worker")),
+            "fan_mode_manual":  int(fan_mode == "manual"),
             "has_fan_fault":    int(any("fan_failure" in t for t in fault_types)),
             "has_power_surge":  int(any("power_surge" in t for t in fault_types)),
+            "has_sensor_drift": int(any("sensor_drift" in t for t in fault_types)),
             "has_fault":        int(len(faults) > 0),
         }
 
     def _update_cumulative(self, machine_id: str, raw: dict) -> None:
-        """Met à jour les compteurs cumulatifs depuis le dernier tick."""
+        """Met a jour les compteurs cumulatifs depuis le dernier tick."""
         dt     = 1.0 / self._tick_hz
         status = raw.get("status", "on")
         prev   = self._prev_status[machine_id]
@@ -328,28 +367,40 @@ class OnlineFeatureBuffer:
             self._ticks_since_shutdown[machine_id] = 0
         else:
             self._ticks_since_shutdown[machine_id] = min(
-                self._ticks_since_shutdown[machine_id] + 1, 9999
+                self._ticks_since_shutdown[machine_id] + 1, 11082
             )
 
         if status == "degraded" and prev == "on":
             self._nb_degraded[machine_id] += 1
 
-        # Ticks depuis dernière panne
+        # Ticks depuis derniere panne
         if raw.get("has_fault", 0):
             self._ticks_since_fault[machine_id] = 0
         else:
             self._ticks_since_fault[machine_id] = min(
-                self._ticks_since_fault[machine_id] + 1, 9999
+                self._ticks_since_fault[machine_id] + 1, 11082
             )
 
-        # Durée en zone chaude (réinitialisée si on sort de la zone)
+        # Duree en zone chaude (reinitialisee si on sort de la zone)
         temp_c = raw.get("temperature_c", 0.0)
         if temp_c > self._hot_threshold:
             self._time_in_hot_s[machine_id] += dt
         else:
             self._time_in_hot_s[machine_id] = 0.0
 
-        # Énergie fans cumulée (loi cubique)
+        # Duree en mode degrade (reinitialisee si on quitte le mode degrade)
+        if status == "degraded":
+            self._time_in_degraded_s[machine_id] += dt
+        else:
+            self._time_in_degraded_s[machine_id] = 0.0
+
+        # Duree en etat "off" (reinitialisee des retour en "on" ou "degraded")
+        if status == "off":
+            self._time_in_off_s[machine_id] += dt
+        else:
+            self._time_in_off_s[machine_id] = 0.0
+
+        # Energie fans cumulee (loi cubique)
         fan_p_nom = _FAN_P_MASTER_W if raw.get("role") == "master" else _FAN_P_WORKER_W
         rpm_ratio = min(1.0, raw.get("fan_rpm_mean", 0.0) / _FAN_MAX_RPM)
         fan_count = raw.get("fan_count", 2.0)
@@ -360,25 +411,28 @@ class OnlineFeatureBuffer:
 
     @staticmethod
     def _default_series() -> pd.Series:
-        """Valeurs par défaut sûres quand aucun historique n'est disponible."""
+        """Valeurs par defaut sures (51 features : 47 + 4 statut)."""
         return pd.Series({
             "temperature_c": 60.0, "sensor_temp_max": 60.0, "sensor_temp_mean": 60.0,
             "power_w": 0.0, "energy_kwh": 0.0, "fan_rpm_mean": 0.0,
-            "fan_rpm_std": 0.0, "fan_count": 2.0, "load_estimated": 0.5,
+            "fan_rpm_std": 0.0, "load_estimated": 0.5, "fan_mode_manual": 0,
             "temp_delta_5s": 0.0, "temp_delta_15s": 0.0, "temp_delta_30s": 0.0,
             "temp_rolling_mean_30s": 60.0, "temp_rolling_mean_60s": 60.0,
             "temp_rolling_std_30s": 0.0,
-            "margin_to_shutdown": 28.0, "margin_pct": 0.318, "margin_delta_30s": 0.0,
+            "margin_to_shutdown": 28.0, "margin_pct": 31.8, "margin_delta_30s": 0.0,
             "load_rolling_mean_30s": 0.5, "load_rolling_mean_60s": 0.5,
             "rpm_delta_15s": 0.0, "rpm_rolling_mean_30s": 0.0,
-            "power_rolling_mean_30s": 0.0, "power_delta_30s": 0.0,
+            "rpm_variance": 0.0, "rpm_cv": 0.0, "rpm_changes_last_60s": 0.0,
+            "power_rolling_mean_30s": 0.0, "power_delta_30s": 0.0, "power_compute_w": 0.0,
             "sensor_max_delta_15s": 0.0, "sensor_max_rolling_mean_30s": 60.0,
             "power_fans_w": 0.0, "fan_energy_ratio": 0.0, "pue_estimated": _PUE_BASELINE,
             "power_fans_rolling_mean_30s": 0.0, "pue_rolling_mean_30s": _PUE_BASELINE,
-            "energy_fans_kwh_cumulated": 0.0,
+            "energy_fans_kwh_cumulated": 0.0, "energy_per_temp_unit": 0.0,
             "time_in_hot_zone_s": 0.0, "nb_shutdowns_episode": 0,
-            "nb_degraded_episode": 0, "ticks_since_last_shutdown": 9999,
-            "has_fan_fault": 0, "has_power_surge": 0,
-            "ticks_since_last_fault": 9999, "is_recovering": 0,
-            "time_in_degraded_s": 0.0, "time_to_failure_s": 999.0, "fault_count": 0,
+            "nb_degraded_episode": 0, "ticks_since_last_shutdown": 11082,
+            "has_fan_fault": 0, "has_power_surge": 0, "has_sensor_drift": 0,
+            "ticks_since_last_fault": 11082, "is_recovering": 0,
+            "time_in_degraded_s": 0.0,
+            # statut one-hot (nouvelles features v1.5)
+            "is_on": 1, "is_degraded": 0, "is_off": 0, "time_in_off_s": 0.0,
         })

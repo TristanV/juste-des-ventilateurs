@@ -322,8 +322,25 @@ Colonnes exclues des features : timestamps, IDs, labels, colonnes 100% NaN (`mac
 - F1 > baseline heuristique
 
 **Lancement :**
+
+Trois labels de prédiction sont disponibles — le nom du label est inclus dans le fichier de sortie :
+
+| Label | Description | Fichier résultat |
+|-------|-------------|-----------------|
+| `failure_60s` | Panne dans 60s — **label superviseur** | `failure_prediction_results_failure_60s.json` |
+| `failure_30s` | Panne dans 30s | `failure_prediction_results_failure_30s.json` |
+| `hot_30s` | T > 95% seuil dans 30s | `failure_prediction_results_hot_30s.json` |
+
 ```bash
-train_models.bat                   # entrainement + evaluation complete
+# Entraîner et benchmarker les 3 labels d'un coup (recommandé)
+run_all_labels.bat
+
+# Ou label par label :
+03_train_models.bat                  # failure_60s (defaut)
+03_train_models.bat failure_30s
+03_train_models.bat hot_30s
+
+# Evaluation seule (sans re-entrainement)
 python -m evaluation.failure_prediction_eval --label failure_60s
 ```
 

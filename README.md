@@ -198,16 +198,46 @@ python -m features.pipeline \
 
 ### Entraîner et évaluer les modèles de prédiction de pannes
 
-```bash
-# Entraînement + évaluation comparative (tous les modèles, label failure_60s)
-train_models.bat
+Trois labels de prédiction sont disponibles :
 
-# Label spécifique
-train_models.bat failure_30s
+| Label | Horizon | Description |
+|-------|---------|-------------|
+| `failure_60s` | 60 s | Panne dans la minute — **utilisé par le superviseur** |
+| `failure_30s` | 30 s | Panne dans les 30 secondes (plus précis, moins de préavis) |
+| `hot_30s`     | 30 s | Température > 95 % du seuil (alerte thermique pure) |
+
+```bash
+# Option recommandée : entraîner et benchmarker les 3 labels d'un coup
+run_all_labels.bat
+
+# Ou script par script, label par label :
+03_train_models.bat                  # failure_60s par défaut
+03_train_models.bat failure_30s
+03_train_models.bat hot_30s
+
+04_train_fan_controllers.bat         # contrôleurs (toujours sur failure_60s)
+
+05_benchmark_offline_metrics.bat              # benchmark failure_60s
+05_benchmark_offline_metrics.bat failure_30s  # benchmark failure_30s
+05_benchmark_offline_metrics.bat hot_30s      # benchmark hot_30s
 
 # Analyse exploratoire rapide (volumes de split, labels, corrélations)
 python ingest_quick_EDA.py --processed-only
 ```
+
+Les résultats sont produits dans `evaluation/results/` avec le label dans le nom :
+```
+failure_prediction_results_failure_60s.json
+failure_prediction_results_failure_30s.json
+failure_prediction_results_hot_30s.json
+benchmark_results_failure_60s.json
+robustness_results_failure_60s.json
+fan_control_results_failure_60s.json
+...
+```
+
+Pour visualiser et comparer les résultats, ouvrir `notebooks/05_evaluation_comparative.ipynb`
+et modifier la variable `LABEL` en tête de notebook.
 
 ### Lancer le superviseur
 

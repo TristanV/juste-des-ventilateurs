@@ -347,7 +347,7 @@ def main() -> None:
 
     # Export JSON
     RESULTS_DIR.mkdir(parents=True, exist_ok=True)
-    out_path = args.output or str(RESULTS_DIR / "benchmark_results.json")
+    out_path = args.output or str(RESULTS_DIR / f"benchmark_results_{args.label}.json")
     payload = {
         "label":    args.label,
         "n_test":   len(X_test),
