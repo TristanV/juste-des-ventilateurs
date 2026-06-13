@@ -3,7 +3,7 @@
 Pour chaque pas de temps, évalue chaque action candidate (niveau RPM)
 via une fonction de coût :
 
-    J(a) = alpha * risk(t)
+    J(a) = alpha * risk(t) * (1 - RPM(a)/RPM_MAX)
           + beta  * heat(t)
           + gamma * energy(a)
           + delta * |RPM(a) - RPM(t-1)| / RPM_MAX
@@ -12,9 +12,13 @@ Choisit l'action qui minimise J(a).
 
 Composantes :
     risk(t)    : risk_score fourni par le prédicteur de pannes (0-1)
-    heat(t)    : temperature_c / t_shutdown  (0-1)
-    energy(a)  : RPM_candidate / RPM_MAX     (proxy conso fan)
+                 pondéré par (1 - RPM/RPM_MAX) : un RPM élevé réduit le risque résiduel
+    heat(t)    : temperature_c / t_shutdown  (0-1), contrainte thermique pure
+    energy(a)  : RPM_candidate / RPM_MAX     (proxy conso fan, pénalité pure)
     |ΔRPM|     : pénalité de changement brusque de consigne
+
+Note : heat n'est pas multiplié par cooling — sinon RPM_MAX minimise toujours J_heat
+indépendamment du risque réel, ce qui noie le signal risk à basse température.
 
 Les paramètres alpha, beta, gamma, delta sont optimisés par grid search
 sur les données d'entraînement.
@@ -28,8 +32,9 @@ from typing import Optional
 import numpy as np
 import pandas as pd
 
-RPM_LEVELS        = [0, 1500, 2500, 3500, 4500]
-RPM_MAX           = 4500
+RPM_LEVELS         = [800, 1500, 2500, 3500, 4500]
+RPM_MIN            = 800    # ventilation minimale de sécurité (évite RPM=0 dégénéré)
+RPM_MAX            = 4500
 DEFAULT_T_SHUTDOWN = 88.0
 
 
@@ -40,19 +45,23 @@ class ScoreController:
 
     def __init__(
         self,
-        alpha: float = 0.50,   # poids risque panne
-        beta:  float = 0.30,   # poids chaleur
-        gamma: float = 0.10,   # poids énergie fans
-        delta: float = 0.10,   # poids changement RPM
+        alpha: float = 0.60,   # poids risque panne * cooling
+        beta:  float = 0.15,   # poids chaleur (contrainte thermique pure)
+        gamma: float = 0.20,   # poids énergie fans (pénalité consommation)
+        delta: float = 0.05,   # poids changement RPM
         t_shutdown: float = DEFAULT_T_SHUTDOWN,
         rpm_levels: Optional[list] = None,
+        rpm_min: int = RPM_MIN,
     ):
         self.alpha      = alpha
         self.beta       = beta
         self.gamma      = gamma
         self.delta      = delta
         self.t_shutdown = t_shutdown
-        self.rpm_levels = rpm_levels or RPM_LEVELS
+        self.rpm_min    = rpm_min
+        # Garantir que rpm_min est le plancher de la liste candidate
+        levels = rpm_levels or RPM_LEVELS
+        self.rpm_levels = sorted(set(max(r, rpm_min) for r in levels))
 
         self._prev_rpm: int = 2500  # RPM initial
         self.best_params_: dict = {}
@@ -68,14 +77,15 @@ class ScoreController:
         temperature_c: float,
         t_shutdown: float,
     ) -> float:
-        heat   = min(temperature_c / max(t_shutdown, 1.0), 1.0)
-        energy = rpm_candidate / RPM_MAX
-        delta  = abs(rpm_candidate - self._prev_rpm) / RPM_MAX
+        heat      = min(temperature_c / max(t_shutdown, 1.0), 1.0)
+        cooling   = 1.0 - rpm_candidate / RPM_MAX   # RPM élevé => moins de risque résiduel
+        energy    = rpm_candidate / RPM_MAX
+        delta_rpm = abs(rpm_candidate - self._prev_rpm) / RPM_MAX
         return (
-            self.alpha * risk_score
-            + self.beta  * heat
-            + self.gamma * energy
-            + self.delta * delta
+            self.alpha * risk_score * cooling   # risque résiduel non traité
+            + self.beta  * heat                 # contrainte thermique pure (indépendante du RPM)
+            + self.gamma * energy               # coût énergétique pur
+            + self.delta * delta_rpm            # pénalité changement brusque
         )
 
     def _best_action(
@@ -133,12 +143,13 @@ class ScoreController:
 
         # Pour chaque ligne, calculer J pour chaque RPM candidat et prendre le min
         # Shape: (n_samples, n_rpm_levels)
-        energy_arr = arr / RPM_MAX                                  # (n_levels,)
-        delta_arr  = np.abs(arr - self._prev_rpm) / RPM_MAX         # (n_levels,)
+        energy_arr  = arr / RPM_MAX                                  # (n_levels,)
+        cooling_arr = 1.0 - energy_arr                               # (n_levels,) RPM élevé => moins de risque résiduel
+        delta_arr   = np.abs(arr - self._prev_rpm) / RPM_MAX         # (n_levels,)
 
-        # J[i, j] = alpha*risk[i] + beta*heat[i] + gamma*energy[j] + delta*delta_arr[j]
+        # J[i,j] = alpha*risk[i]*cooling[j] + beta*heat[i] + gamma*energy[j] + delta*delta[j]
         J = (
-            self.alpha * risk_scores[:, None]
+            self.alpha * risk_scores[:, None] * cooling_arr[None, :]
             + self.beta  * heat_arr[:, None]
             + self.gamma * energy_arr[None, :]
             + self.delta * delta_arr[None, :]
@@ -172,9 +183,9 @@ class ScoreController:
         if "temperature_c" not in X_train.columns:
             return self
 
-        alpha_grid = alpha_grid or [0.3, 0.7]
-        beta_grid  = beta_grid  or [0.2, 0.3, 0.4]
-        gamma_grid = gamma_grid or [0.05, 0.15]
+        alpha_grid = alpha_grid or [0.3, 0.5, 0.7]
+        beta_grid  = beta_grid  or [0.1, 0.2, 0.3]
+        gamma_grid = gamma_grid or [0.02, 0.05, 0.10]
 
         if risk_scores_train is None:
             risk_scores_train = np.zeros(len(X_train))
@@ -206,6 +217,7 @@ class ScoreController:
                     ctrl = ScoreController(
                         alpha=alpha, beta=beta, gamma=gamma, delta=delta,
                         t_shutdown=self.t_shutdown,
+                        rpm_min=self.rpm_min,
                     )
                     rpms = ctrl.decide_batch(X_train, risk_scores=risk_scores_train)
 
@@ -254,6 +266,7 @@ class ScoreController:
             "gamma":      self.gamma,
             "delta":      self.delta,
             "t_shutdown": self.t_shutdown,
+            "rpm_min":    self.rpm_min,
             "rpm_levels": self.rpm_levels,
             "best_params": self.best_params_,
         }
@@ -271,6 +284,7 @@ class ScoreController:
             delta=cfg["delta"],
             t_shutdown=cfg.get("t_shutdown", DEFAULT_T_SHUTDOWN),
             rpm_levels=cfg.get("rpm_levels", RPM_LEVELS),
+            rpm_min=cfg.get("rpm_min", RPM_MIN),
         )
         obj.best_params_ = cfg.get("best_params", {})
         return obj
@@ -278,5 +292,5 @@ class ScoreController:
     def __repr__(self) -> str:
         return (
             f"ScoreController(alpha={self.alpha}, beta={self.beta}, "
-            f"gamma={self.gamma}, delta={self.delta})"
+            f"gamma={self.gamma}, delta={self.delta}, rpm_min={self.rpm_min})"
         )

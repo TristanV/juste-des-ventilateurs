@@ -4,7 +4,7 @@ Apprend à reproduire la politique "oracle" encodée dans `action_class`
 (générée par features/labeler.py à partir des données simulées).
 
 Classes d'action :
-    0 → 0    RPM  (arret fans)
+    0 → 800  RPM  (ventilation minimale)
     1 → 1500 RPM  (ralenti)
     2 → 2500 RPM  (modere)
     3 → 3500 RPM  (eleve)
@@ -27,8 +27,8 @@ import pandas as pd
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.preprocessing import StandardScaler
 
-ACTION_TO_RPM = {0: 0, 1: 1500, 2: 2500, 3: 3500, 4: 4500}
-RPM_LEVELS    = [0, 1500, 2500, 3500, 4500]
+ACTION_TO_RPM = {0: 800, 1: 1500, 2: 2500, 3: 3500, 4: 4500}  # plancher 800 RPM
+RPM_LEVELS    = [800, 1500, 2500, 3500, 4500]
 
 # Colonnes à exclure des features (reprises du splitter)
 NON_FEATURE_COLS = {

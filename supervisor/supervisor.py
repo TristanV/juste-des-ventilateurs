@@ -58,11 +58,12 @@ logging.getLogger("httpcore").setLevel(logging.WARNING)
 # Constantes
 # ---------------------------------------------------------------------------
 
-RPM_LEVELS     = [0, 1500, 2500, 3500, 4500]
-RPM_HIGH       = 4500    # RPM d'urgence quand risk_score > threshold
-RPM_DEFAULT    = 2500    # RPM de sécurité si aucune décision possible
-RPM_MIN        = 800     # Plancher : ventilation minimale même à froid
-RISK_THRESHOLD = 0.60    # Seuil de surcharge risque -> RPM_HIGH
+RPM_LEVELS      = [800, 1500, 2500, 3500, 4500]
+RPM_HIGH        = 4500    # RPM d'urgence quand risk_score > threshold
+RPM_DEFAULT     = 2500    # RPM de sécurité si aucune décision possible
+RPM_MIN         = 800     # Plancher : ventilation minimale même à froid
+RISK_THRESHOLD  = 0.60    # Seuil de surcharge risque -> RPM_HIGH
+HOT30S_THRESHOLD = float(os.environ.get("HOT30S_THRESHOLD", "0.5"))  # Override surchauffe
 
 # Seuil de risk_score à partir duquel on logue une machine en INFO
 RISK_LOG_THRESHOLD = float(os.environ.get("RISK_LOG_THRESHOLD", "0.05"))
@@ -307,6 +308,13 @@ class Supervisor:
         self.predictor  = load_predictor(predictor_name, label) if mode == "ml" else None
         self.controller = load_controller(controller_name)       if mode == "ml" else None
 
+        # Prédicteur hot_30s pour l'override surchauffe imminente (Phase 7.4)
+        self.hot30s_predictor = load_predictor(predictor_name, "hot_30s") if mode == "ml" else None
+        if self.hot30s_predictor is not None:
+            logger.info("Prédicteur hot_30s chargé (override surchauffe >= %.2f)", HOT30S_THRESHOLD)
+        else:
+            logger.info("Prédicteur hot_30s absent -- override surchauffe désactivé")
+
         # Ordre des features attendu par le modele (depuis le splitter d'entrainement)
         self._feature_order: list[str] | None = None
         if self.predictor is not None:
@@ -364,26 +372,46 @@ class Supervisor:
             logger.warning("predict_proba echoue : %s", e)
             return 0.0
 
-    def _decide_rpm(self, state_series: "pd.Series", risk_score: float) -> int:
+    def _predict_hot30s(self, state_series: "pd.Series") -> float:
+        """Score de surchauffe imminente (hot_30s). Retourne 0.0 si prédicteur absent."""
+        if self.hot30s_predictor is None:
+            return 0.0
+        import pandas as pd
+        X = pd.DataFrame([state_series])
+        if self._feature_order is not None:
+            X = X.reindex(columns=self._feature_order, fill_value=0.0)
+        try:
+            proba = self.hot30s_predictor.predict_proba(X)
+            return float(proba[0, 1])
+        except Exception as e:
+            logger.debug("predict_proba hot_30s echoue : %s", e)
+            return 0.0
+
+    def _decide_rpm(self, state_series: "pd.Series", risk_score: float,
+                    hot30s_score: float = 0.0) -> tuple[int, bool, bool]:
+        """Retourne (rpm, risk_override, hot30s_override)."""
         if risk_score >= self.risk_threshold:
-            return RPM_HIGH
+            return RPM_HIGH, True, False
+        if hot30s_score >= HOT30S_THRESHOLD:
+            logger.debug("hot30s override : score=%.3f >= %.2f -> RPM_HIGH", hot30s_score, HOT30S_THRESHOLD)
+            return RPM_HIGH, False, True
         if self.mode == "native":
-            return -1
+            return -1, False, False
         if self.controller is None:
-            return RPM_DEFAULT
+            return RPM_DEFAULT, False, False
         import pandas as pd
         X = pd.DataFrame([state_series])
         risk_arr = np.array([risk_score])
         try:
             rpms = self.controller.decide_batch(X, risk_scores=risk_arr)
-            return max(int(rpms[0]), RPM_MIN)
+            return max(int(rpms[0]), RPM_MIN), False, False
         except TypeError:
             try:
                 rpms = self.controller.decide_batch(X)
-                return max(int(rpms[0]), RPM_MIN)
+                return max(int(rpms[0]), RPM_MIN), False, False
             except Exception as e:
-                logger.debug("decide_batch échoué : %s", e)
-                return RPM_DEFAULT
+                logger.debug("decide_batch echoue : %s", e)
+                return RPM_DEFAULT, False, False
 
     # ------------------------------------------------------------------
     # Traitement d'une machine
@@ -398,25 +426,28 @@ class Supervisor:
         if snapshot is not None:
             self._feat_buffer.update(machine_id, snapshot)
 
-        state    = self._feat_buffer.get_features(machine_id)
-        risk     = self._predict_risk(state)
-        rpm      = self._decide_rpm(state, risk)
-        prev_rpm = self._prev_rpm.get(machine_id, RPM_DEFAULT)
+        state      = self._feat_buffer.get_features(machine_id)
+        risk       = self._predict_risk(state)
+        hot30s     = self._predict_hot30s(state)
+        rpm, risk_ov, hot30s_ov = self._decide_rpm(state, risk, hot30s)
+        prev_rpm   = self._prev_rpm.get(machine_id, RPM_DEFAULT)
 
         temp_c = float(state.get("temperature_c", 0.0))
 
         entry = {
-            "ts":            datetime.now(timezone.utc).isoformat(),
-            "machine_id":    machine_id,
-            "temperature_c": temp_c,
-            "status":        str(state.get("status", "unknown") if snapshot is None
-                                else snapshot.get("status", "unknown")),
-            "fan_rpm_mean":  float(state.get("fan_rpm_mean", 0.0)),
-            "risk_score":    round(risk, 4),
-            "rpm_decided":   rpm,
-            "rpm_previous":  prev_rpm,
-            "mode":          self.mode,
-            "risk_override": risk >= self.risk_threshold,
+            "ts":              datetime.now(timezone.utc).isoformat(),
+            "machine_id":      machine_id,
+            "temperature_c":   temp_c,
+            "status":          str(state.get("status", "unknown") if snapshot is None
+                                   else snapshot.get("status", "unknown")),
+            "fan_rpm_mean":    float(state.get("fan_rpm_mean", 0.0)),
+            "risk_score":      round(risk, 4),
+            "hot30s_score":    round(hot30s, 4),
+            "rpm_decided":     rpm,
+            "rpm_previous":    prev_rpm,
+            "mode":            self.mode,
+            "risk_override":   risk_ov,
+            "hot30s_override": hot30s_ov,
         }
 
         # Envoyer la commande seulement si RPM change
@@ -430,17 +461,18 @@ class Supervisor:
             self._prev_rpm[machine_id] = rpm
 
             # Log INFO : changement RPM ou risque élevé
-            risk_tag = " [RISK OVERRIDE]" if entry["risk_override"] else ""
-            dry_tag  = " [DRY RUN]" if self.dry_run else ""
+            override_tag = (" [RISK OVERRIDE]"  if risk_ov   else
+                            " [HOT30S OVERRIDE]" if hot30s_ov else "")
+            dry_tag = " [DRY RUN]" if self.dry_run else ""
             logger.info(
-                "  %-20s  T=%5.1f degC  risk=%.2f  RPM %d->%d%s%s",
-                machine_id, temp_c, risk, prev_rpm, rpm, risk_tag, dry_tag,
+                "  %-20s  T=%5.1f degC  risk=%.2f  hot30s=%.2f  RPM %d->%d%s%s",
+                machine_id, temp_c, risk, hot30s, prev_rpm, rpm, override_tag, dry_tag,
             )
-        elif risk > RISK_LOG_THRESHOLD:
-            # Log INFO : risque notable même sans changement RPM
+        elif risk > RISK_LOG_THRESHOLD or hot30s > HOT30S_THRESHOLD * 0.7:
+            # Log INFO : risque ou surchauffe notable même sans changement RPM
             logger.info(
-                "  %-20s  T=%5.1f degC  risk=%.2f  RPM %d (stable)",
-                machine_id, temp_c, risk, rpm if rpm >= 0 else prev_rpm,
+                "  %-20s  T=%5.1f degC  risk=%.2f  hot30s=%.2f  RPM %d (stable)",
+                machine_id, temp_c, risk, hot30s, rpm if rpm >= 0 else prev_rpm,
             )
         else:
             logger.debug(

@@ -1,7 +1,7 @@
 # Roadmap — Juste des Ventilateurs
 
 Projet M2 Data/IA — LaPlateforme_  
-Version 1.4 — Juin 2026
+Version 1.5 — Juin 2026
 
 ---
 
@@ -226,7 +226,7 @@ python -m evaluation.failure_prediction_eval --label failure_60s --models baseli
 ### Module : `models/fan_control/`
 
 ### Espace d'actions
-Actions discrétisées : `RPM ∈ {0, 1500, 2500, 3500, 4500}` par ventilateur.
+Actions discrétisées : `RPM ∈ {800, 1500, 2500, 3500, 4500}` par ventilateur (plancher 800 RPM — ventilation minimale de sécurité).
 
 ### Tâches
 
@@ -245,8 +245,12 @@ Actions discrétisées : `RPM ∈ {0, 1500, 2500, 3500, 4500}` par ventilateur.
   - Features : toutes les features du splitter + risk_score optionnel
   - StandardScaler + class_weight=balanced
 - [x] **Contrôleur à score multi-objectif** (`models/fan_control/score_controller.py`)
-  - `J(a) = α·risk + β·heat + γ·energy(a) + δ·|ΔRPM|/RPM_MAX`
-  - Paramètres α, β, γ, δ optimisés par grid search
+  - `J(a) = α·risk·(1 - RPM/RPM_MAX) + β·heat + γ·energy(a) + δ·|ΔRPM|/RPM_MAX`
+  - `risk` pondéré par `cooling` : un RPM élevé réduit le risque résiduel
+  - `heat` contrainte thermique pure (non amplifiée par RPM — évite le biais RPM_MAX)
+  - RPM minimum 800 (plancher de sécurité, plus de RPM=0 dégénéré)
+  - Paramètres α=0.60, β=0.15, γ=0.20, δ=0.05 (défauts recalibrés)
+  - Grid search élargi : alpha∈[0.3,0.5,0.7], beta∈[0.1,0.2,0.3], gamma∈[0.02,0.05,0.10]
 - [ ] **(Optionnel avancé) Bandit contextuel** (`models/fan_control/contextual_bandit.py`)
 - [x] **Évaluation comparative** (`evaluation/fan_control_eval.py`)
   - Métriques : mean_rpm, T_mean, %temps_critique, action_accuracy, rpm_mae, high_rpm_when_dangerous
@@ -470,22 +474,67 @@ supervisor/supervisor.py
 - [x] `supervisor/supervisor.py` : refactoring boucle principale -- `_loop_mqtt()` (chemin principal) + `_loop_rest()` (fallback), `_refresh_speed()` periodique
 - [x] `supervisor/supervisor.py` : fallback REST automatique si MQTT indisponible au demarrage
 - [x] `supervisor/supervisor.py` : correction `get_speed_multiplier()` vers `/simulation/speed`
-- [x] `supervisor/supervisor.py` : fix Windows `asyncio.WindowsSelectorEventLoopPolicy` (aiomqtt/paho incompatible avec ProactorEventLoop)
-- [x] `supervisor/supervisor.py` : logging DEBUG features dans `_predict_risk()`, `--log-level` CLI
-- [x] `.env.example` : `MQTT_BROKER_HOST`, `MQTT_BROKER_PORT`, `DECISION_INTERVAL_TICKS`, `MQTT_TOPIC_ROOT`, `CLUSTER_ID`
-- [x] `docker-compose.yml` : variables MQTT + `host.docker.internal` pour Docker Desktop Windows
-- [x] `tests/test_phase7_supervisor.py` : 18 tests -- `OnlineFeatureBuffer` (7), `MqttTelemetryConsumer` (5), helpers superviseur (6)
-- [x] `tests/test_phase6_supervisor.py` : mise a jour compatibilite Phase 7 (suppression `snapshot_to_series`, `OnlineFeatureBuffer`)
-- [x] `tests/conftest.py` : isolation stubs xgboost entre modules de test
-- [x] `notebooks/06_phase7_mqtt_supervision.ipynb` : analyse MQTT live, features, decisions, comparaison vitesses
+- [x] `supervisor/supervisor.py` : `RPM_MIN=800` dans `_decide_rpm()` et `RPM_LEVELS`
 
 **Livrables :**
 - `supervisor/mqtt_telemetry.py`
-- `supervisor/supervisor.py` refactorise (721 lignes)
-- `tests/test_phase7_supervisor.py` (18 tests)
-- `tests/conftest.py`
-- `notebooks/06_phase7_mqtt_supervision.ipynb`
-- Mise a jour `docker-compose.yml`, `.env.example`
+- `supervisor/supervisor.py` modifié (MQTT + fallback REST)
+
+---
+
+### Tâche 4 — Override hot_30s dans le superviseur ✅
+
+**Objectif :** Déclencher RPM_HIGH dès qu'une surchauffe imminente est détectée (hot_30s), indépendamment du risque de panne failure_60s.
+
+- [x] Chargement de `logistic_hot_30s.joblib` dans `Supervisor.__init__()` (`self.hot30s_predictor`)
+- [x] `HOT30S_THRESHOLD = 0.5` (configurable via env var `HOT30S_THRESHOLD`)
+- [x] `_predict_hot30s(state_series)` → score entre 0 et 1
+- [x] `_decide_rpm()` retourne désormais `(rpm, risk_override, hot30s_override)`
+- [x] Override RPM_HIGH si `hot30s_score >= HOT30S_THRESHOLD`
+- [x] Champ `hot30s_score` et `hot30s_override` dans le log JSONL
+- [x] Log INFO avec tag `[HOT30S OVERRIDE]` et affichage `hot30s=X.XX`
+
+**Comportement :**
+- Si `risk_score >= 0.60` → RPM_HIGH (risk_override)
+- Sinon si `hot30s_score >= 0.50` → RPM_HIGH (hot30s_override)
+- Sinon → décision normale du contrôleur
+
+**Livrables :**
+- `supervisor/supervisor.py` modifié (hot30s_predictor, _predict_hot30s, _decide_rpm, _process_machine)
+
+---
+
+### Tâche 5 — Ré-entraînement du contrôleur supervisé sur oracle corrigé ✅
+
+**Objectif :** Corriger le biais RPM=0 dans l'oracle d'entraînement du contrôleur supervisé. L'oracle (`action_class`) était généré avec `RPM_LEVELS = [0, 1500, 2500, 3500, 4500]` — la classe 0 correspondait à RPM=0 (arrêt des fans). Avec `RPM_MIN=800`, la classe 0 doit correspondre à 800 RPM.
+
+- [x] `features/labeler.py` : `RPM_LEVELS = [800, 1500, 2500, 3500, 4500]`
+- [x] `models/fan_control/supervised_controller.py` : `ACTION_TO_RPM = {0: 800, ...}`, `RPM_LEVELS = [800, ...]`
+- [ ] Relancer `04_train_fan_controllers.bat` pour régénérer `supervised.joblib` avec le nouvel oracle
+
+**Note :** Les fichiers `data/processed/` existants contiennent encore l'ancien `action_class` (classe 0 = RPM 0). Il faut relancer `ingest_gen_features.bat` puis `04_train_fan_controllers.bat` pour régénérer l'oracle corrigé.
+
+**Commandes :**
+```bash
+# Régénérer les features avec le nouvel oracle (RPM_LEVELS corrigé)
+ingest_gen_features.bat
+
+# Ré-entraîner le contrôleur supervisé
+04_train_fan_controllers.bat
+```
+
+**Livrables :**
+- `features/labeler.py` modifié
+- `models/fan_control/supervised_controller.py` modifié
+- `models/fan_control/saved/supervised.joblib` (après ré-entraînement)
+ntraîné sur l'ancienne distribution.
+
+**Tâches de développement :**
+- [ ] Regénérer les features processées : `ingest_gen_features.bat` (les données brutes n'ont pas changé)
+- [ ] Réentraîner tous les modèles : `run_all_labels.bat` (Phase 4 + Phase 5)
+- [ ] Vérifier `action_accuracy` du contrôleur supervisé sur le nouveau jeu de test
+- [ ] Vérifier `high_rpm_when_dangerous` — attendu ≥ 0.65 (meilleur que threshold/PID)
+- [ ] Mettre à jour les résultats dans le notebook 04
 
 ### Commandes Phase 7
 ```bash

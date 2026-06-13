@@ -28,7 +28,7 @@ import pandas as pd
 logger = logging.getLogger(__name__)
 
 # Niveaux RPM discrets pour le contrôleur (doit correspondre aux specs)
-RPM_LEVELS = [0, 1500, 2500, 3500, 4500]
+RPM_LEVELS = [800, 1500, 2500, 3500, 4500]  # plancher 800 RPM (ventilation minimale)
 
 # Seuil "trop chaud" pour le label hot_30s : 95% du shutdown
 _HOT_RATIO = 0.95
